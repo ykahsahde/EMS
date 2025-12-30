@@ -11,19 +11,21 @@ COPY . .
 # Build for production
 RUN npm run build
 
-# Production stage - serve static files
+# Production stage
 FROM node:18-alpine AS production
 
 WORKDIR /app
 
-# Install serve to host static files
-RUN npm install -g serve@14.2.0
+# Copy package files and install production dependencies
+COPY package*.json ./
+RUN npm install --omit=dev
 
-# Copy built files from builder
+# Copy built files and server
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/server.js ./server.js
 
 # Railway uses dynamic PORT
 EXPOSE 3000
 
-# Serve the static files - use port flag correctly
-CMD ["sh", "-c", "serve -s dist -p ${PORT:-3000}"]
+# Start the Express server
+CMD ["node", "server.js"]

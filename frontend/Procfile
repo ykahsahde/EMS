@@ -1,1 +1,1 @@
-web: npx serve@14.2.0 -s dist -p $PORT
+web: npm start

@@ -5,10 +5,10 @@
 nixPkgs = ["nodejs_18", "npm"]
 
 [phases.install]
-cmds = ["npm install", "npm install -g serve@14.2.0"]
+cmds = ["npm install"]
 
 [phases.build]
 cmds = ["npm run build"]
 
 [start]
-cmd = "serve -s dist -p $PORT"
+cmd = "npm start"
