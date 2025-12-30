@@ -1,0 +1,93 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: raymond_postgres
+    environment:
+      POSTGRES_USER: raymond_admin
+      POSTGRES_PASSWORD: Raymond@2024Secure
+      POSTGRES_DB: raymond_attendance
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - raymond_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raymond_admin -d raymond_attendance"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # pgAdmin for Database Management
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: raymond_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@raymond.com
+      PGADMIN_DEFAULT_PASSWORD: Raymond@Admin2024
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    ports:
+      - "5050:80"
+    networks:
+      - raymond_network
+    depends_on:
+      - postgres
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: raymond_backend
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: raymond_admin
+      DB_PASSWORD: Raymond@2024Secure
+      DB_NAME: raymond_attendance
+      JWT_SECRET: RaymondLifestyle2024SecretKey@JWT!Secure
+      JWT_EXPIRES_IN: 8h
+      GOOGLE_SHEETS_ENABLED: "true"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      - face_data:/app/face_data
+    ports:
+      - "3000:3000"
+    networks:
+      - raymond_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Frontend (Development)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: raymond_frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    networks:
+      - raymond_network
+    depends_on:
+      - backend
+
+networks:
+  raymond_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  pgadmin_data:
+  face_data:
