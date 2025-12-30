@@ -31,23 +31,9 @@ app.use(helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
-// CORS configuration - support multiple origins for Railway deployment
-const allowedOrigins = process.env.CORS_ORIGIN 
-    ? process.env.CORS_ORIGIN.split(',').map(origin => origin.trim())
-    : ['http://localhost:5173'];
-
+// CORS configuration
 app.use(cors({
-    origin: function(origin, callback) {
-        // Allow requests with no origin (mobile apps, curl, etc.)
-        if (!origin) return callback(null, true);
-        
-        if (allowedOrigins.includes(origin) || 
-            origin.endsWith('.railway.app') || 
-            origin.endsWith('.up.railway.app')) {
-            return callback(null, true);
-        }
-        return callback(new Error('Not allowed by CORS'), false);
-    },
+    origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
@@ -76,29 +62,6 @@ app.use(requestLogger);
 
 // Static files
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
-
-// Root endpoint - API info
-app.get('/', (req, res) => {
-    res.status(200).json({
-        name: 'Raymond Attendance Management API',
-        version: '1.0.0',
-        status: 'running',
-        endpoints: {
-            health: '/api/health',
-            auth: '/api/auth',
-            users: '/api/users',
-            attendance: '/api/attendance',
-            leaves: '/api/leaves',
-            departments: '/api/departments',
-            shifts: '/api/shifts',
-            holidays: '/api/holidays',
-            reports: '/api/reports',
-            face: '/api/face',
-            config: '/api/config'
-        },
-        documentation: 'Use /api/* endpoints to access the API'
-    });
-});
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
