@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult } = require('express-validator');
-const { query, transaction } = require('../config/database');
+const prisma = require('../config/prisma');
 const { authenticate, authorize, isHROrAdmin, canAccessEmployee } = require('../middleware/auth');
 const { attendanceValidation } = require('../middleware/validators');
 const { createAuditLog } = require('../middleware/logger');
@@ -17,11 +17,11 @@ const RAYMOND_OFFICE_LOCATION = {
 // Function to get location verification setting from database
 const getLocationVerificationRequired = async () => {
     try {
-        const result = await query(
-            "SELECT config_value FROM attendance_config WHERE config_key = 'location_verification_required'"
-        );
-        if (result.rows.length > 0) {
-            return result.rows[0].config_value === 'true';
+        const config = await prisma.attendanceConfig.findUnique({
+            where: { configKey: 'location_verification_required' }
+        });
+        if (config) {
+            return config.configValue === 'true';
         }
         return true; // Default to true if not found
     } catch (error) {
@@ -39,8 +39,8 @@ const calculateDistance = (lat1, lon1, lat2, lon2) => {
     const Δλ = (lon2 - lon1) * Math.PI / 180;
 
     const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
-              Math.cos(φ1) * Math.cos(φ2) *
-              Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+        Math.cos(φ1) * Math.cos(φ2) *
+        Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
     return R * c; // Distance in meters
@@ -60,8 +60,8 @@ const verifyLocation = (location) => {
     );
 
     if (distance > RAYMOND_OFFICE_LOCATION.radius) {
-        return { 
-            valid: false, 
+        return {
+            valid: false,
             message: `You are ${Math.round(distance)} meters from Raymond office. Please come within ${RAYMOND_OFFICE_LOCATION.radius} meters to mark attendance.`,
             distance: Math.round(distance)
         };
@@ -89,7 +89,7 @@ router.post('/check-in', authenticate, async (req, res, next) => {
         // Check if location verification is required (admin setting)
         let locationData = null;
         let locationCheck = { valid: true, distance: null };
-        
+
         if (locationVerificationRequired) {
             // Location verification is mandatory
             locationCheck = verifyLocation(location);
@@ -125,12 +125,12 @@ router.post('/check-in', authenticate, async (req, res, next) => {
             }
         }
 
-        const result = await query(
-            `SELECT mark_attendance($1, 'CHECK_IN', $2, $3, $4) as result`,
-            [req.user.id, is_face_verified, face_score || null, locationData ? JSON.stringify(locationData) : null]
-        );
+        // Call stored procedure via $queryRaw
+        const result = await prisma.$queryRaw`
+            SELECT mark_attendance(${req.user.id}::uuid, 'CHECK_IN', ${is_face_verified}::boolean, ${face_score || null}::decimal, ${locationData ? JSON.stringify(locationData) : null}::jsonb) as result
+        `;
 
-        const response = result.rows[0].result;
+        const response = result[0].result;
 
         if (!response.success) {
             return res.status(400).json({
@@ -170,7 +170,7 @@ router.post('/check-out', authenticate, async (req, res, next) => {
 
         // Check if location verification is required (admin setting)
         let locationData = null;
-        
+
         if (locationVerificationRequired) {
             // Location verification is mandatory
             const locationCheck = verifyLocation(location);
@@ -206,12 +206,12 @@ router.post('/check-out', authenticate, async (req, res, next) => {
             }
         }
 
-        const result = await query(
-            `SELECT mark_attendance($1, 'CHECK_OUT', false, null, $2) as result`,
-            [req.user.id, locationData ? JSON.stringify(locationData) : null]
-        );
+        // Call stored procedure via $queryRaw
+        const result = await prisma.$queryRaw`
+            SELECT mark_attendance(${req.user.id}::uuid, 'CHECK_OUT', false::boolean, null::decimal, ${locationData ? JSON.stringify(locationData) : null}::jsonb) as result
+        `;
 
-        const response = result.rows[0].result;
+        const response = result[0].result;
 
         if (!response.success) {
             return res.status(400).json({
@@ -248,13 +248,22 @@ router.post('/check-out', authenticate, async (req, res, next) => {
 // Helper function to find user by face descriptor
 const findUserByFaceDescriptor = async (faceDescriptor) => {
     // Get all users with registered face
-    const result = await query(
-        `SELECT id, employee_id, first_name, last_name, email, face_descriptor 
-         FROM users 
-         WHERE face_descriptor IS NOT NULL AND status = 'ACTIVE'`
-    );
+    const users = await prisma.user.findMany({
+        where: {
+            faceDescriptor: { not: null },
+            status: 'ACTIVE'
+        },
+        select: {
+            id: true,
+            employeeId: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            faceDescriptor: true
+        }
+    });
 
-    if (result.rows.length === 0) {
+    if (users.length === 0) {
         console.log('No users with registered faces found');
         return null;
     }
@@ -264,45 +273,45 @@ const findUserByFaceDescriptor = async (faceDescriptor) => {
     let bestDistance = Infinity;
     const THRESHOLD = 0.6; // Face matching threshold (lower is stricter)
 
-    console.log(`Comparing face against ${result.rows.length} registered users...`);
+    console.log(`Comparing face against ${users.length} registered users...`);
 
-    for (const user of result.rows) {
+    for (const user of users) {
         // Support multiple descriptor formats:
         // 1. { descriptor: [...] } - single descriptor
         // 2. { face_descriptors: [[...], [...]] } - multiple descriptors (from multi-image registration)
         // 3. Direct array [...] - raw descriptor
-        
+
         let storedDescriptors = [];
-        
-        if (user.face_descriptor) {
-            if (user.face_descriptor.descriptor) {
+
+        if (user.faceDescriptor) {
+            if (user.faceDescriptor.descriptor) {
                 // Format 1: { descriptor: [...] }
-                storedDescriptors = [user.face_descriptor.descriptor];
-            } else if (user.face_descriptor.face_descriptors && Array.isArray(user.face_descriptor.face_descriptors)) {
+                storedDescriptors = [user.faceDescriptor.descriptor];
+            } else if (user.faceDescriptor.face_descriptors && Array.isArray(user.faceDescriptor.face_descriptors)) {
                 // Format 2: { face_descriptors: [[...], [...]] }
-                storedDescriptors = user.face_descriptor.face_descriptors;
-            } else if (Array.isArray(user.face_descriptor)) {
+                storedDescriptors = user.faceDescriptor.face_descriptors;
+            } else if (Array.isArray(user.faceDescriptor)) {
                 // Format 3: Direct array
-                storedDescriptors = [user.face_descriptor];
+                storedDescriptors = [user.faceDescriptor];
             }
         }
 
         if (storedDescriptors.length === 0) {
-            console.log(`User ${user.employee_id} has no valid face descriptors`);
+            console.log(`User ${user.employeeId} has no valid face descriptors`);
             continue;
         }
 
-        console.log(`User ${user.employee_id} has ${storedDescriptors.length} registered face(s)`);
+        console.log(`User ${user.employeeId} has ${storedDescriptors.length} registered face(s)`);
 
         // Compare against all stored descriptors for this user
         for (let j = 0; j < storedDescriptors.length; j++) {
             const storedDescriptor = storedDescriptors[j];
-            
+
             if (!Array.isArray(storedDescriptor) || storedDescriptor.length !== 128) {
                 console.log(`  Descriptor ${j + 1} invalid (not 128-length array)`);
                 continue;
             }
-            
+
             // Calculate Euclidean distance
             let distance = 0;
             for (let i = 0; i < faceDescriptor.length; i++) {
@@ -317,9 +326,9 @@ const findUserByFaceDescriptor = async (faceDescriptor) => {
                 bestDistance = distance;
                 bestMatch = {
                     id: user.id,
-                    employee_id: user.employee_id,
-                    first_name: user.first_name,
-                    last_name: user.last_name,
+                    employee_id: user.employeeId,
+                    first_name: user.firstName,
+                    last_name: user.lastName,
                     email: user.email,
                     score: 1 - distance // Convert distance to similarity score
                 };
@@ -401,12 +410,12 @@ router.post('/public/check-in', async (req, res, next) => {
             });
         }
 
-        const result = await query(
-            `SELECT mark_attendance($1, 'CHECK_IN', $2, $3, $4) as result`,
-            [matchedUser.id, true, matchedUser.score, locationData ? JSON.stringify(locationData) : null]
-        );
+        // Call stored procedure via $queryRaw
+        const result = await prisma.$queryRaw`
+            SELECT mark_attendance(${matchedUser.id}::uuid, 'CHECK_IN', true::boolean, ${matchedUser.score}::decimal, ${locationData ? JSON.stringify(locationData) : null}::jsonb) as result
+        `;
 
-        const response = result.rows[0].result;
+        const response = result[0].result;
 
         if (!response.success) {
             return res.status(400).json({
@@ -416,7 +425,7 @@ router.post('/public/check-in', async (req, res, next) => {
         }
 
         await createAuditLog(matchedUser.id, 'CREATE', 'attendance_records', null, null,
-            { action: 'PUBLIC_CHECK_IN', face_verified: true, face_score: matchedUser.score, location_verified: locationVerificationRequired }, 
+            { action: 'PUBLIC_CHECK_IN', face_verified: true, face_score: matchedUser.score, location_verified: locationVerificationRequired },
             'Employee public check-in via face recognition', req.ip);
 
         res.json({
@@ -504,12 +513,12 @@ router.post('/public/check-out', async (req, res, next) => {
             });
         }
 
-        const result = await query(
-            `SELECT mark_attendance($1, 'CHECK_OUT', false, null, $2) as result`,
-            [matchedUser.id, locationData ? JSON.stringify(locationData) : null]
-        );
+        // Call stored procedure via $queryRaw
+        const result = await prisma.$queryRaw`
+            SELECT mark_attendance(${matchedUser.id}::uuid, 'CHECK_OUT', false::boolean, null::decimal, ${locationData ? JSON.stringify(locationData) : null}::jsonb) as result
+        `;
 
-        const response = result.rows[0].result;
+        const response = result[0].result;
 
         if (!response.success) {
             return res.status(400).json({
@@ -519,7 +528,7 @@ router.post('/public/check-out', async (req, res, next) => {
         }
 
         await createAuditLog(matchedUser.id, 'UPDATE', 'attendance_records', null, null,
-            { action: 'PUBLIC_CHECK_OUT', face_verified: true, location_verified: locationVerificationRequired, total_hours: response.total_hours }, 
+            { action: 'PUBLIC_CHECK_OUT', face_verified: true, location_verified: locationVerificationRequired, total_hours: response.total_hours },
             'Employee public check-out via face recognition', req.ip);
 
         res.json({
@@ -545,28 +554,53 @@ router.post('/public/check-out', async (req, res, next) => {
 // Get today's attendance status
 router.get('/today', authenticate, async (req, res, next) => {
     try {
-        const result = await query(
-            `SELECT ar.*, s.name as shift_name, s.start_time as shift_start, s.end_time as shift_end
-             FROM attendance_records ar
-             LEFT JOIN shifts s ON ar.shift_id = s.id
-             WHERE ar.user_id = $1 AND ar.date = CURRENT_DATE`,
-            [req.user.id]
-        );
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
 
-        const shiftResult = await query(
-            `SELECT s.* FROM shifts s
-             JOIN users u ON u.shift_id = s.id
-             WHERE u.id = $1`,
-            [req.user.id]
-        );
+        const attendance = await prisma.attendanceRecord.findFirst({
+            where: {
+                userId: req.user.id,
+                date: today
+            },
+            include: {
+                shift: { select: { name: true, startTime: true, endTime: true } }
+            }
+        });
+
+        const user = await prisma.user.findUnique({
+            where: { id: req.user.id },
+            include: {
+                shift: true
+            }
+        });
 
         res.json({
             success: true,
             data: {
-                attendance: result.rows[0] || null,
-                shift: shiftResult.rows[0] || null,
-                can_check_in: !result.rows[0]?.check_in_time,
-                can_check_out: result.rows[0]?.check_in_time && !result.rows[0]?.check_out_time
+                attendance: attendance ? {
+                    id: attendance.id,
+                    user_id: attendance.userId,
+                    date: attendance.date,
+                    check_in_time: attendance.checkInTime,
+                    check_out_time: attendance.checkOutTime,
+                    status: attendance.status,
+                    total_hours: attendance.totalHours,
+                    overtime_hours: attendance.overtimeHours,
+                    is_face_verified: attendance.isFaceVerified,
+                    is_manual_entry: attendance.isManualEntry,
+                    shift_name: attendance.shift?.name,
+                    shift_start: attendance.shift?.startTime,
+                    shift_end: attendance.shift?.endTime
+                } : null,
+                shift: user?.shift ? {
+                    id: user.shift.id,
+                    name: user.shift.name,
+                    start_time: user.shift.startTime,
+                    end_time: user.shift.endTime,
+                    grace_period_minutes: user.shift.gracePeriodMinutes
+                } : null,
+                can_check_in: !attendance?.checkInTime,
+                can_check_out: attendance?.checkInTime && !attendance?.checkOutTime
             }
         });
     } catch (error) {
@@ -586,90 +620,88 @@ router.get('/', authenticate, attendanceValidation.getRecords, async (req, res, 
         }
 
         const { start_date, end_date, user_id, department_id, status, page = 1, limit = 50 } = req.query;
-        const offset = (page - 1) * limit;
+        const skip = (parseInt(page) - 1) * parseInt(limit);
 
-        // Build base query based on role
-        let queryText = `
-            SELECT ar.*, 
-                   u.employee_id, u.first_name, u.last_name, u.email,
-                   d.name as department_name, s.name as shift_name,
-                   editor.first_name || ' ' || editor.last_name as edited_by_name
-            FROM attendance_records ar
-            JOIN users u ON ar.user_id = u.id
-            LEFT JOIN departments d ON u.department_id = d.id
-            LEFT JOIN shifts s ON ar.shift_id = s.id
-            LEFT JOIN users editor ON ar.manual_entry_by = editor.id
-            WHERE 1=1
-        `;
-        const params = [];
-        let paramCount = 0;
+        let whereClause = {};
 
         // Role-based filtering
         if (req.user.role === 'EMPLOYEE') {
-            paramCount++;
-            queryText += ` AND ar.user_id = $${paramCount}`;
-            params.push(req.user.id);
+            whereClause.userId = req.user.id;
         } else if (req.user.role === 'MANAGER') {
             // Manager can only see attendance of their department employees
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(req.user.department_id);
+            whereClause.user = { departmentId: req.user.department_id };
         }
 
         // Additional filters
-        if (start_date) {
-            paramCount++;
-            queryText += ` AND ar.date >= $${paramCount}`;
-            params.push(start_date);
-        }
-
-        if (end_date) {
-            paramCount++;
-            queryText += ` AND ar.date <= $${paramCount}`;
-            params.push(end_date);
-        }
+        if (start_date) whereClause.date = { ...(whereClause.date || {}), gte: new Date(start_date) };
+        if (end_date) whereClause.date = { ...(whereClause.date || {}), lte: new Date(end_date) };
 
         if (user_id && ['ADMIN', 'HR'].includes(req.user.role)) {
-            paramCount++;
-            queryText += ` AND ar.user_id = $${paramCount}`;
-            params.push(user_id);
+            whereClause.userId = user_id;
         }
 
         if (department_id && ['ADMIN', 'HR'].includes(req.user.role)) {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(department_id);
+            whereClause.user = { ...(whereClause.user || {}), departmentId: department_id };
         }
 
         if (status) {
-            paramCount++;
-            queryText += ` AND ar.status = $${paramCount}`;
-            params.push(status);
+            whereClause.status = status;
         }
 
-        // Get total count
-        const countQuery = queryText.replace(/SELECT .* FROM/, 'SELECT COUNT(*) FROM');
-        const countResult = await query(countQuery, params);
-        const totalCount = parseInt(countResult.rows[0].count);
-
-        // Add ordering and pagination
-        queryText += ` ORDER BY ar.date DESC, u.first_name`;
-        queryText += ` LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
-        params.push(limit, offset);
-
-        const result = await query(queryText, params);
+        const [records, totalCount] = await Promise.all([
+            prisma.attendanceRecord.findMany({
+                where: whereClause,
+                include: {
+                    user: {
+                        select: {
+                            employeeId: true,
+                            firstName: true,
+                            lastName: true,
+                            email: true,
+                            department: { select: { name: true } }
+                        }
+                    },
+                    shift: { select: { name: true } },
+                    manualEntryBy: { select: { firstName: true, lastName: true } }
+                },
+                orderBy: [{ date: 'desc' }, { user: { firstName: 'asc' } }],
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.attendanceRecord.count({ where: whereClause })
+        ]);
 
         res.json({
             success: true,
-            data: result.rows.map(record => ({
-                ...record,
-                employee_name: `${record.first_name} ${record.last_name}`
+            data: records.map(record => ({
+                id: record.id,
+                user_id: record.userId,
+                date: record.date,
+                check_in_time: record.checkInTime,
+                check_out_time: record.checkOutTime,
+                status: record.status,
+                total_hours: record.totalHours,
+                overtime_hours: record.overtimeHours,
+                is_face_verified: record.isFaceVerified,
+                face_confidence_score: record.faceConfidenceScore,
+                location_data: record.locationData,
+                is_manual_entry: record.isManualEntry,
+                is_locked: record.isLocked,
+                notes: record.notes,
+                employee_id: record.user.employeeId,
+                first_name: record.user.firstName,
+                last_name: record.user.lastName,
+                email: record.user.email,
+                department_name: record.user.department?.name,
+                shift_name: record.shift?.name,
+                edited_by_name: record.manualEntryBy ? `${record.manualEntryBy.firstName} ${record.manualEntryBy.lastName}` : null,
+                employee_name: `${record.user.firstName} ${record.user.lastName}`
             })),
             pagination: {
                 page: parseInt(page),
                 limit: parseInt(limit),
                 total: totalCount,
-                pages: Math.ceil(totalCount / limit)
+                pages: Math.ceil(totalCount / parseInt(limit))
             }
         });
     } catch (error) {
@@ -684,42 +716,51 @@ router.get('/user/:userId', authenticate, canAccessEmployee, async (req, res, ne
         const { month, year } = req.query;
 
         const currentDate = new Date();
-        const targetMonth = month || currentDate.getMonth() + 1;
-        const targetYear = year || currentDate.getFullYear();
+        const targetMonth = parseInt(month) || currentDate.getMonth() + 1;
+        const targetYear = parseInt(year) || currentDate.getFullYear();
 
-        const result = await query(
-            `SELECT ar.*, s.name as shift_name
-             FROM attendance_records ar
-             LEFT JOIN shifts s ON ar.shift_id = s.id
-             WHERE ar.user_id = $1 
-             AND EXTRACT(MONTH FROM ar.date) = $2
-             AND EXTRACT(YEAR FROM ar.date) = $3
-             ORDER BY ar.date DESC`,
-            [userId, targetMonth, targetYear]
-        );
+        // Calculate date range for the month
+        const startDate = new Date(targetYear, targetMonth - 1, 1);
+        const endDate = new Date(targetYear, targetMonth, 0);
 
-        // Get summary
-        const summaryResult = await query(
-            `SELECT 
-                COUNT(CASE WHEN status = 'PRESENT' THEN 1 END) as present_days,
-                COUNT(CASE WHEN status = 'ABSENT' THEN 1 END) as absent_days,
-                COUNT(CASE WHEN status = 'LATE' THEN 1 END) as late_days,
-                COUNT(CASE WHEN status = 'HALF_DAY' THEN 1 END) as half_days,
-                COUNT(CASE WHEN status = 'ON_LEAVE' THEN 1 END) as leave_days,
-                COALESCE(SUM(total_hours), 0) as total_hours,
-                COALESCE(SUM(overtime_hours), 0) as overtime_hours
-             FROM attendance_records
-             WHERE user_id = $1 
-             AND EXTRACT(MONTH FROM date) = $2
-             AND EXTRACT(YEAR FROM date) = $3`,
-            [userId, targetMonth, targetYear]
-        );
+        const records = await prisma.attendanceRecord.findMany({
+            where: {
+                userId: userId,
+                date: { gte: startDate, lte: endDate }
+            },
+            include: {
+                shift: { select: { name: true } }
+            },
+            orderBy: { date: 'desc' }
+        });
+
+        // Calculate summary
+        const summary = {
+            present_days: records.filter(r => r.status === 'PRESENT').length,
+            absent_days: records.filter(r => r.status === 'ABSENT').length,
+            late_days: records.filter(r => r.status === 'LATE').length,
+            half_days: records.filter(r => r.status === 'HALF_DAY').length,
+            leave_days: records.filter(r => r.status === 'ON_LEAVE').length,
+            total_hours: records.reduce((sum, r) => sum + (parseFloat(r.totalHours) || 0), 0),
+            overtime_hours: records.reduce((sum, r) => sum + (parseFloat(r.overtimeHours) || 0), 0)
+        };
 
         res.json({
             success: true,
             data: {
-                records: result.rows,
-                summary: summaryResult.rows[0],
+                records: records.map(r => ({
+                    id: r.id,
+                    date: r.date,
+                    check_in_time: r.checkInTime,
+                    check_out_time: r.checkOutTime,
+                    status: r.status,
+                    total_hours: r.totalHours,
+                    overtime_hours: r.overtimeHours,
+                    is_face_verified: r.isFaceVerified,
+                    is_manual_entry: r.isManualEntry,
+                    shift_name: r.shift?.name
+                })),
+                summary,
                 month: targetMonth,
                 year: targetYear
             }
@@ -742,66 +783,85 @@ router.post('/manual', authenticate, isHROrAdmin, attendanceValidation.manualEnt
 
         const { user_id, date, check_in_time, check_out_time, status, reason } = req.body;
 
+        const targetDate = new Date(date);
+        targetDate.setHours(0, 0, 0, 0);
+
         // Check if record already exists
-        const existingRecord = await query(
-            'SELECT * FROM attendance_records WHERE user_id = $1 AND date = $2',
-            [user_id, date]
-        );
+        const existingRecord = await prisma.attendanceRecord.findUnique({
+            where: {
+                userId_date: {
+                    userId: user_id,
+                    date: targetDate
+                }
+            }
+        });
 
         // Check if attendance is locked
-        if (existingRecord.rows[0]?.is_locked) {
+        if (existingRecord?.isLocked) {
             return res.status(400).json({
                 success: false,
                 error: 'Attendance for this date is locked and cannot be modified'
             });
         }
 
-        const dateObj = new Date(date);
         const checkInDateTime = new Date(`${date}T${check_in_time}`);
         const checkOutDateTime = check_out_time ? new Date(`${date}T${check_out_time}`) : null;
 
         // Get user's shift
-        const shiftResult = await query(
-            'SELECT shift_id FROM users WHERE id = $1',
-            [user_id]
-        );
-        const shiftId = shiftResult.rows[0]?.shift_id;
+        const user = await prisma.user.findUnique({
+            where: { id: user_id },
+            select: { shiftId: true }
+        });
 
         let result;
-        if (existingRecord.rows.length > 0) {
+        if (existingRecord) {
             // Update existing record
-            result = await query(
-                `UPDATE attendance_records 
-                 SET check_in_time = $1, check_out_time = $2, status = $3, 
-                     is_manual_entry = TRUE, manual_entry_by = $4
-                 WHERE user_id = $5 AND date = $6
-                 RETURNING *`,
-                [checkInDateTime, checkOutDateTime, status, req.user.id, user_id, date]
-            );
+            result = await prisma.attendanceRecord.update({
+                where: { id: existingRecord.id },
+                data: {
+                    checkInTime: checkInDateTime,
+                    checkOutTime: checkOutDateTime,
+                    status: status,
+                    isManualEntry: true,
+                    manualEntryById: req.user.id
+                }
+            });
 
-            await createAuditLog(req.user.id, 'ATTENDANCE_EDIT', 'attendance_records', 
-                existingRecord.rows[0].id, existingRecord.rows[0],
+            await createAuditLog(req.user.id, 'ATTENDANCE_EDIT', 'attendance_records',
+                existingRecord.id, existingRecord,
                 { check_in_time, check_out_time, status }, reason, req.ip);
         } else {
             // Create new record
-            result = await query(
-                `INSERT INTO attendance_records 
-                 (user_id, date, check_in_time, check_out_time, status, shift_id,
-                  is_manual_entry, manual_entry_by)
-                 VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)
-                 RETURNING *`,
-                [user_id, date, checkInDateTime, checkOutDateTime, status, shiftId, req.user.id]
-            );
+            result = await prisma.attendanceRecord.create({
+                data: {
+                    userId: user_id,
+                    date: targetDate,
+                    checkInTime: checkInDateTime,
+                    checkOutTime: checkOutDateTime,
+                    status: status,
+                    shiftId: user?.shiftId,
+                    isManualEntry: true,
+                    manualEntryById: req.user.id
+                }
+            });
 
-            await createAuditLog(req.user.id, 'CREATE', 'attendance_records', 
-                result.rows[0].id, null,
+            await createAuditLog(req.user.id, 'CREATE', 'attendance_records',
+                result.id, null,
                 { user_id, date, check_in_time, check_out_time, status }, reason, req.ip);
         }
 
         res.json({
             success: true,
             message: 'Manual attendance entry recorded successfully',
-            data: result.rows[0]
+            data: {
+                id: result.id,
+                user_id: result.userId,
+                date: result.date,
+                check_in_time: result.checkInTime,
+                check_out_time: result.checkOutTime,
+                status: result.status,
+                is_manual_entry: result.isManualEntry
+            }
         });
     } catch (error) {
         next(error);
@@ -820,15 +880,15 @@ router.post('/lock', authenticate, authorize('ADMIN'), async (req, res, next) =>
             });
         }
 
-        const result = await query(
-            `SELECT lock_attendance_for_payroll($1, $2, $3) as result`,
-            [req.user.id, month, year]
-        );
+        // Call stored procedure via $queryRaw
+        const result = await prisma.$queryRaw`
+            SELECT lock_attendance_for_payroll(${req.user.id}::uuid, ${month}::integer, ${year}::integer) as result
+        `;
 
         res.json({
             success: true,
             message: `Attendance locked for ${month}/${year}`,
-            data: result.rows[0].result
+            data: result[0].result
         });
     } catch (error) {
         next(error);
@@ -839,64 +899,79 @@ router.post('/lock', authenticate, authorize('ADMIN'), async (req, res, next) =>
 router.get('/summary/dashboard', authenticate, async (req, res, next) => {
     try {
         const currentDate = new Date();
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
         const currentMonth = currentDate.getMonth() + 1;
         const currentYear = currentDate.getFullYear();
+        const startOfMonth = new Date(currentYear, currentMonth - 1, 1);
+        const endOfMonth = new Date(currentYear, currentMonth, 0);
 
-        let userFilter = '';
-        let recentUserFilter = '';
-        const params = [currentMonth, currentYear];
-        const recentParams = [];
+        let whereClause = {
+            date: { gte: startOfMonth, lte: endOfMonth }
+        };
+
+        let recentWhereClause = {
+            date: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }
+        };
 
         if (req.user.role === 'EMPLOYEE') {
-            userFilter = ' AND ar.user_id = $3';
-            recentUserFilter = ' AND ar.user_id = $1';
-            params.push(req.user.id);
-            recentParams.push(req.user.id);
+            whereClause.userId = req.user.id;
+            recentWhereClause.userId = req.user.id;
         } else if (req.user.role === 'MANAGER') {
-            userFilter = ' AND (ar.user_id = $3 OR u.manager_id = $3)';
-            recentUserFilter = ' AND (ar.user_id = $1 OR u.manager_id = $1)';
-            params.push(req.user.id);
-            recentParams.push(req.user.id);
+            whereClause.OR = [
+                { userId: req.user.id },
+                { user: { managerId: req.user.id } }
+            ];
+            recentWhereClause.OR = [
+                { userId: req.user.id },
+                { user: { managerId: req.user.id } }
+            ];
         }
 
-        // Get this month's summary
-        const summaryResult = await query(
-            `SELECT 
-                COUNT(DISTINCT ar.user_id) as total_employees,
-                COUNT(CASE WHEN ar.status = 'PRESENT' AND ar.date = CURRENT_DATE THEN 1 END) as present_today,
-                COUNT(CASE WHEN ar.status = 'ABSENT' AND ar.date = CURRENT_DATE THEN 1 END) as absent_today,
-                COUNT(CASE WHEN ar.status = 'LATE' AND ar.date = CURRENT_DATE THEN 1 END) as late_today,
-                COUNT(CASE WHEN ar.status = 'ON_LEAVE' AND ar.date = CURRENT_DATE THEN 1 END) as on_leave_today,
-                COUNT(CASE WHEN ar.status = 'PRESENT' THEN 1 END) as present_this_month,
-                COUNT(CASE WHEN ar.status = 'ABSENT' THEN 1 END) as absent_this_month,
-                COUNT(CASE WHEN ar.status = 'LATE' THEN 1 END) as late_this_month
-             FROM attendance_records ar
-             JOIN users u ON ar.user_id = u.id
-             WHERE EXTRACT(MONTH FROM ar.date) = $1
-             AND EXTRACT(YEAR FROM ar.date) = $2
-             ${userFilter}`,
-            params
-        );
+        // Get this month's records
+        const monthRecords = await prisma.attendanceRecord.findMany({
+            where: whereClause,
+            select: { userId: true, status: true, date: true }
+        });
+
+        // Calculate summary
+        const summary = {
+            total_employees: new Set(monthRecords.map(r => r.userId)).size,
+            present_today: monthRecords.filter(r => r.status === 'PRESENT' && r.date.toDateString() === today.toDateString()).length,
+            absent_today: monthRecords.filter(r => r.status === 'ABSENT' && r.date.toDateString() === today.toDateString()).length,
+            late_today: monthRecords.filter(r => r.status === 'LATE' && r.date.toDateString() === today.toDateString()).length,
+            on_leave_today: monthRecords.filter(r => r.status === 'ON_LEAVE' && r.date.toDateString() === today.toDateString()).length,
+            present_this_month: monthRecords.filter(r => r.status === 'PRESENT').length,
+            absent_this_month: monthRecords.filter(r => r.status === 'ABSENT').length,
+            late_this_month: monthRecords.filter(r => r.status === 'LATE').length
+        };
 
         // Get recent attendance
-        let recentQuery = `SELECT ar.date, ar.status, ar.check_in_time, ar.check_out_time, ar.total_hours,
-                    u.employee_id, u.first_name, u.last_name
-             FROM attendance_records ar
-             JOIN users u ON ar.user_id = u.id
-             WHERE ar.date >= CURRENT_DATE - INTERVAL '7 days'
-             ${recentUserFilter}
-             ORDER BY ar.date DESC, ar.check_in_time DESC
-             LIMIT 20`;
-
-        const recentResult = await query(recentQuery, recentParams);
+        const recentRecords = await prisma.attendanceRecord.findMany({
+            where: recentWhereClause,
+            include: {
+                user: {
+                    select: { employeeId: true, firstName: true, lastName: true }
+                }
+            },
+            orderBy: [{ date: 'desc' }, { checkInTime: 'desc' }],
+            take: 20
+        });
 
         res.json({
             success: true,
             data: {
-                summary: summaryResult.rows[0],
-                recent_records: recentResult.rows.map(r => ({
-                    ...r,
-                    employee_name: `${r.first_name} ${r.last_name}`
+                summary,
+                recent_records: recentRecords.map(r => ({
+                    date: r.date,
+                    status: r.status,
+                    check_in_time: r.checkInTime,
+                    check_out_time: r.checkOutTime,
+                    total_hours: r.totalHours,
+                    employee_id: r.user.employeeId,
+                    first_name: r.user.firstName,
+                    last_name: r.user.lastName,
+                    employee_name: `${r.user.firstName} ${r.user.lastName}`
                 })),
                 month: currentMonth,
                 year: currentYear
@@ -939,7 +1014,7 @@ router.put('/location-verification', authenticate, async (req, res, next) => {
         }
 
         const { enabled } = req.body;
-        
+
         if (typeof enabled !== 'boolean') {
             return res.status(400).json({
                 success: false,
@@ -947,25 +1022,21 @@ router.put('/location-verification', authenticate, async (req, res, next) => {
             });
         }
 
-        // Update in database
-        const existsResult = await query(
-            "SELECT id FROM attendance_config WHERE config_key = 'location_verification_required'"
-        );
-        
-        if (existsResult.rows.length > 0) {
-            await query(
-                `UPDATE attendance_config 
-                 SET config_value = $1, updated_by = $2, updated_at = CURRENT_TIMESTAMP
-                 WHERE config_key = 'location_verification_required'`,
-                [enabled.toString(), req.user.id]
-            );
-        } else {
-            await query(
-                `INSERT INTO attendance_config (config_key, config_value, description, data_type, updated_by)
-                 VALUES ('location_verification_required', $1, 'Require location verification for attendance', 'boolean', $2)`,
-                [enabled.toString(), req.user.id]
-            );
-        }
+        // Update in database using Prisma
+        await prisma.attendanceConfig.upsert({
+            where: { configKey: 'location_verification_required' },
+            update: {
+                configValue: enabled.toString(),
+                updatedById: req.user.id
+            },
+            create: {
+                configKey: 'location_verification_required',
+                configValue: enabled.toString(),
+                description: 'Require location verification for attendance',
+                dataType: 'boolean',
+                updatedById: req.user.id
+            }
+        });
 
         await createAuditLog(req.user.id, 'UPDATE', 'system_config', null,
             { location_verification_required: !enabled },

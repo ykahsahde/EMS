@@ -1,4 +1,4 @@
-const { query } = require('../config/database');
+const prisma = require('../config/prisma');
 
 // Request logging middleware
 const requestLogger = async (req, res, next) => {
@@ -24,17 +24,36 @@ const requestLogger = async (req, res, next) => {
     next();
 };
 
-// Audit logging function
+// Helper to normalize IP address for PostgreSQL INET type
+const normalizeIpAddress = (ip) => {
+    if (!ip) return null;
+    // Remove IPv6 prefix for IPv4 addresses
+    if (ip.startsWith('::ffff:')) {
+        return ip.substring(7);
+    }
+    // Handle localhost variations
+    if (ip === '::1') {
+        return '127.0.0.1';
+    }
+    return ip;
+};
+
+// Audit logging function using Prisma
 const createAuditLog = async (userId, action, entityType, entityId, oldValues, newValues, reason = null, ipAddress = null) => {
     try {
-        await query(
-            `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, old_values, new_values, reason, ip_address)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-            [userId, action, entityType, entityId, 
-             oldValues ? JSON.stringify(oldValues) : null,
-             newValues ? JSON.stringify(newValues) : null,
-             reason, ipAddress]
-        );
+        const normalizedIp = normalizeIpAddress(ipAddress);
+        await prisma.auditLog.create({
+            data: {
+                userId: userId,
+                action: action,
+                entityType: entityType,
+                entityId: entityId,
+                oldValues: oldValues || undefined,
+                newValues: newValues || undefined,
+                reason: reason,
+                ipAddress: normalizedIp
+            }
+        });
     } catch (error) {
         console.error('Failed to create audit log:', error);
     }

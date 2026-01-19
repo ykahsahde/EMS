@@ -1,0 +1,315 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Department {
+  id          String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name        String    @unique @db.VarChar(100)
+  code        String    @unique @db.VarChar(20)
+  description String?
+  headId      String?   @map("head_id") @db.Uuid
+  isActive    Boolean?  @default(true) @map("is_active")
+  createdAt   DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime? @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  head        User?     @relation("DepartmentHead", fields: [headId], references: [id], onUpdate: NoAction, map: "fk_department_head")
+  users       User[]    @relation("UserDepartment")
+
+  @@map("departments")
+}
+
+model Shift {
+  id                 String             @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name               String             @db.VarChar(100)
+  code               String             @unique @db.VarChar(20)
+  shiftType          ShiftType          @default(DAY) @map("shift_type")
+  startTime          DateTime           @map("start_time") @db.Time(6)
+  endTime            DateTime           @map("end_time") @db.Time(6)
+  gracePeriodMinutes Int?               @default(15) @map("grace_period_minutes")
+  halfDayHours       Decimal?           @default(4.0) @map("half_day_hours") @db.Decimal(4, 2)
+  fullDayHours       Decimal?           @default(8.0) @map("full_day_hours") @db.Decimal(4, 2)
+  isActive           Boolean?           @default(true) @map("is_active")
+  createdAt          DateTime?          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime?          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  attendanceRecords  AttendanceRecord[]
+  users              User[]
+
+  @@map("shifts")
+}
+
+model User {
+  id                String             @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  employeeId        String             @unique @map("employee_id") @db.VarChar(20)
+  email             String             @unique @db.VarChar(255)
+  passwordHash      String             @map("password_hash") @db.VarChar(255)
+  firstName         String             @map("first_name") @db.VarChar(100)
+  lastName          String             @map("last_name") @db.VarChar(100)
+  phone             String?            @db.VarChar(20)
+  role              UserRole           @default(EMPLOYEE)
+  status            UserStatus         @default(ACTIVE)
+  departmentId      String?            @map("department_id") @db.Uuid
+  shiftId           String?            @map("shift_id") @db.Uuid
+  managerId         String?            @map("manager_id") @db.Uuid
+  dateOfJoining     DateTime           @map("date_of_joining") @db.Date
+  dateOfBirth       DateTime?          @map("date_of_birth") @db.Date
+  address           String?
+  emergencyContact  String?            @map("emergency_contact") @db.VarChar(20)
+  profilePictureUrl String?            @map("profile_picture_url")
+  faceDescriptor    Json?              @map("face_descriptor")
+  faceRegisteredAt  DateTime?          @map("face_registered_at") @db.Timestamptz(6)
+  lastLogin         DateTime?          @map("last_login") @db.Timestamptz(6)
+  passwordChangedAt DateTime?          @map("password_changed_at") @db.Timestamptz(6)
+  createdAt         DateTime?          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime?          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdBy         String?            @map("created_by") @db.Uuid
+  configUpdates     AttendanceConfig[]
+  lockedAttendance  AttendanceRecord[] @relation("LockedBy")
+  manualEntries     AttendanceRecord[] @relation("ManualEntryBy")
+  attendanceRecords AttendanceRecord[] @relation("UserAttendance")
+  auditLogs         AuditLog[]
+  departmentsHeaded Department[]       @relation("DepartmentHead")
+  holidaysCreated   Holiday[]
+  leaveBalances     LeaveBalance[]
+  approvedLeaves    LeaveRequest[]     @relation("LeaveApprover")
+  leaveRequests     LeaveRequest[]     @relation("UserLeaveRequests")
+  sessions          UserSession[]
+  creator           User?              @relation("UserCreator", fields: [createdBy], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  createdUsers      User[]             @relation("UserCreator")
+  department        Department?        @relation("UserDepartment", fields: [departmentId], references: [id], onUpdate: NoAction)
+  manager           User?              @relation("ManagerSubordinates", fields: [managerId], references: [id], onUpdate: NoAction)
+  subordinates      User[]             @relation("ManagerSubordinates")
+  shift             Shift?             @relation(fields: [shiftId], references: [id], onUpdate: NoAction)
+
+  @@index([departmentId], map: "idx_users_department")
+  @@index([email], map: "idx_users_email")
+  @@index([employeeId], map: "idx_users_employee_id")
+  @@index([managerId], map: "idx_users_manager")
+  @@index([role], map: "idx_users_role")
+  @@index([status], map: "idx_users_status")
+  @@map("users")
+}
+
+model AttendanceRecord {
+  id                    String           @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId                String           @map("user_id") @db.Uuid
+  date                  DateTime         @db.Date
+  checkInTime           DateTime?        @map("check_in_time") @db.Timestamptz(6)
+  checkOutTime          DateTime?        @map("check_out_time") @db.Timestamptz(6)
+  status                AttendanceStatus @default(ABSENT)
+  shiftId               String?          @map("shift_id") @db.Uuid
+  totalHours            Decimal?         @map("total_hours") @db.Decimal(5, 2)
+  overtimeHours         Decimal?         @default(0) @map("overtime_hours") @db.Decimal(5, 2)
+  isFaceVerified        Boolean?         @default(false) @map("is_face_verified")
+  faceVerificationScore Decimal?         @map("face_verification_score") @db.Decimal(5, 4)
+  checkInLocation       Json?            @map("check_in_location")
+  checkOutLocation      Json?            @map("check_out_location")
+  isManualEntry         Boolean?         @default(false) @map("is_manual_entry")
+  manualEntryById       String?          @map("manual_entry_by") @db.Uuid
+  isLocked              Boolean?         @default(false) @map("is_locked")
+  lockedAt              DateTime?        @map("locked_at") @db.Timestamptz(6)
+  lockedById            String?          @map("locked_by") @db.Uuid
+  notes                 String?
+  createdAt             DateTime?        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime?        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  lockedBy              User?            @relation("LockedBy", fields: [lockedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  manualEntryBy         User?            @relation("ManualEntryBy", fields: [manualEntryById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  shift                 Shift?           @relation(fields: [shiftId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  user                  User             @relation("UserAttendance", fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([userId, date], map: "unique_user_date")
+  @@index([date], map: "idx_attendance_date")
+  @@index([status], map: "idx_attendance_status")
+  @@index([userId, date], map: "idx_attendance_user_date")
+  @@index([userId], map: "idx_attendance_user_id")
+  @@map("attendance_records")
+}
+
+model LeaveBalance {
+  id            String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  year          Int
+  casualTotal   Int?      @default(12) @map("casual_total")
+  casualUsed    Int?      @default(0) @map("casual_used")
+  casualPending Int?      @default(0) @map("casual_pending")
+  sickTotal     Int?      @default(12) @map("sick_total")
+  sickUsed      Int?      @default(0) @map("sick_used")
+  sickPending   Int?      @default(0) @map("sick_pending")
+  paidTotal     Int?      @default(15) @map("paid_total")
+  paidUsed      Int?      @default(0) @map("paid_used")
+  paidPending   Int?      @default(0) @map("paid_pending")
+  unpaidUsed    Int?      @default(0) @map("unpaid_used")
+  unpaidPending Int?      @default(0) @map("unpaid_pending")
+  createdAt     DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime? @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([userId, year], map: "unique_user_year")
+  @@map("leave_balances")
+}
+
+model LeaveRequest {
+  id              String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId          String      @map("user_id") @db.Uuid
+  leaveType       LeaveType   @map("leave_type")
+  startDate       DateTime    @map("start_date") @db.Date
+  endDate         DateTime    @map("end_date") @db.Date
+  totalDays       Int         @map("total_days")
+  reason          String
+  status          LeaveStatus @default(PENDING)
+  approvedById    String?     @map("approved_by") @db.Uuid
+  approvedAt      DateTime?   @map("approved_at") @db.Timestamptz(6)
+  rejectionReason String?     @map("rejection_reason")
+  attachmentUrl   String?     @map("attachment_url")
+  createdAt       DateTime?   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime?   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  approvedBy      User?       @relation("LeaveApprover", fields: [approvedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  user            User        @relation("UserLeaveRequests", fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([approvedById], map: "idx_leave_requests_approver")
+  @@index([startDate, endDate], map: "idx_leave_requests_dates")
+  @@index([status], map: "idx_leave_requests_status")
+  @@index([userId], map: "idx_leave_requests_user")
+  @@map("leave_requests")
+}
+
+model Holiday {
+  id          String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name        String    @db.VarChar(100)
+  date        DateTime  @unique @db.Date
+  description String?
+  isOptional  Boolean?  @default(false) @map("is_optional")
+  year        Int
+  createdById String?   @map("created_by") @db.Uuid
+  createdAt   DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime? @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  createdBy   User?     @relation(fields: [createdById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([date], map: "idx_holidays_date")
+  @@index([year], map: "idx_holidays_year")
+  @@map("holidays")
+}
+
+model AttendanceConfig {
+  id          String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  configKey   String    @unique @map("config_key") @db.VarChar(100)
+  configValue String    @map("config_value")
+  description String?
+  dataType    String?   @default("string") @map("data_type") @db.VarChar(20)
+  updatedById String?   @map("updated_by") @db.Uuid
+  createdAt   DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime? @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  updatedBy   User?     @relation(fields: [updatedById], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@map("attendance_config")
+}
+
+model AuditLog {
+  id         String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId     String?     @map("user_id") @db.Uuid
+  action     AuditAction
+  entityType String      @map("entity_type") @db.VarChar(50)
+  entityId   String?     @map("entity_id") @db.Uuid
+  oldValues  Json?       @map("old_values")
+  newValues  Json?       @map("new_values")
+  ipAddress  String?     @map("ip_address") @db.Inet
+  userAgent  String?     @map("user_agent")
+  reason     String?
+  createdAt  DateTime?   @default(now()) @map("created_at") @db.Timestamptz(6)
+  user       User?       @relation(fields: [userId], references: [id], onUpdate: NoAction)
+
+  @@index([action], map: "idx_audit_logs_action")
+  @@index([createdAt], map: "idx_audit_logs_created")
+  @@index([entityType, entityId], map: "idx_audit_logs_entity")
+  @@index([userId], map: "idx_audit_logs_user")
+  @@map("audit_logs")
+}
+
+model UserSession {
+  id           String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  tokenHash    String    @map("token_hash") @db.VarChar(255)
+  ipAddress    String?   @map("ip_address") @db.Inet
+  userAgent    String?   @map("user_agent")
+  isActive     Boolean?  @default(true) @map("is_active")
+  expiresAt    DateTime  @map("expires_at") @db.Timestamptz(6)
+  createdAt    DateTime? @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastActivity DateTime? @default(now()) @map("last_activity") @db.Timestamptz(6)
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([tokenHash], map: "idx_sessions_token")
+  @@index([userId], map: "idx_sessions_user")
+  @@map("user_sessions")
+}
+
+enum UserRole {
+  ADMIN
+  HR
+  MANAGER
+  EMPLOYEE
+  GM
+
+  @@map("user_role")
+}
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+
+  @@map("user_status")
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  HALF_DAY
+  ON_LEAVE
+  HOLIDAY
+
+  @@map("attendance_status")
+}
+
+enum LeaveType {
+  CASUAL
+  SICK
+  PAID
+  UNPAID
+  MATERNITY
+  PATERNITY
+
+  @@map("leave_type")
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+
+  @@map("leave_status")
+}
+
+enum ShiftType {
+  DAY
+  NIGHT
+  ROTATIONAL
+  FLEXIBLE
+
+  @@map("shift_type")
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  LOGIN
+  LOGOUT
+  ATTENDANCE_EDIT
+
+  @@map("audit_action")
+}

@@ -4,7 +4,7 @@ import { useAuth } from '../contexts/AuthContext'
 import { usersAPI, departmentAPI, shiftAPI } from '../services/api'
 import { 
   Users, Plus, Search, Filter, Edit2, Trash2, 
-  Mail, Phone, Building, UserCheck, UserX, Eye, Crown, Shield, Star
+  Mail, Phone, Building, UserCheck, UserX, Eye, Crown, Shield, Star, KeyRound, Lock, X
 } from 'lucide-react'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
@@ -20,6 +20,13 @@ const Employees = () => {
   const [filterRole, setFilterRole] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
   const [nextEmployeeId, setNextEmployeeId] = useState('')
+  
+  // Password reset modal state
+  const [showResetPasswordModal, setShowResetPasswordModal] = useState(false)
+  const [resetPasswordUser, setResetPasswordUser] = useState(null)
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [showNewPassword, setShowNewPassword] = useState(false)
 
   // Form state - default joining_date to today
   const [formData, setFormData] = useState({
@@ -128,6 +135,51 @@ const Employees = () => {
       toast.error(error.response?.data?.error || 'Failed to update status')
     }
   })
+
+  // Reset password mutation
+  const resetPasswordMutation = useMutation({
+    mutationFn: ({ id, new_password }) => usersAPI.resetPassword(id, new_password),
+    onSuccess: () => {
+      toast.success('Password reset successfully!')
+      setShowResetPasswordModal(false)
+      setResetPasswordUser(null)
+      setNewPassword('')
+      setConfirmPassword('')
+    },
+    onError: (error) => {
+      toast.error(error.response?.data?.error || 'Failed to reset password')
+    }
+  })
+
+  // Handle reset password
+  const handleResetPassword = (employee) => {
+    setResetPasswordUser(employee)
+    setNewPassword('')
+    setConfirmPassword('')
+    setShowResetPasswordModal(true)
+  }
+
+  const submitResetPassword = (e) => {
+    e.preventDefault()
+    
+    if (newPassword.length < 8) {
+      toast.error('Password must be at least 8 characters')
+      return
+    }
+    
+    const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])/
+    if (!passwordRegex.test(newPassword)) {
+      toast.error('Password must contain uppercase, lowercase, number and special character')
+      return
+    }
+    
+    if (newPassword !== confirmPassword) {
+      toast.error('Passwords do not match')
+      return
+    }
+    
+    resetPasswordMutation.mutate({ id: resetPasswordUser.id, new_password: newPassword })
+  }
 
   const resetForm = () => {
     setFormData({
@@ -469,6 +521,16 @@ const Employees = () => {
                               <Edit2 className="w-4 h-4" />
                             </button>
                           )}
+                          {/* Reset Password button - Admin only */}
+                          {isAdmin && employee.id !== user.id && (
+                            <button
+                              onClick={() => handleResetPassword(employee)}
+                              className="p-1 text-gray-500 hover:text-amber-600"
+                              title="Reset Password"
+                            >
+                              <KeyRound className="w-4 h-4" />
+                            </button>
+                          )}
                           {/* Deactivate button - Cannot deactivate GM */}
                           {employee.role !== 'GM' && (isAdmin || isHR || isGM || (isManager && employee.role === 'EMPLOYEE' && employee.department_id === user?.department_id)) && (
                             <button
@@ -747,6 +809,127 @@ const Employees = () => {
                     ? 'Saving...' 
                     : editingUser ? 'Update Employee' : 'Add Employee'
                   }
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Reset Password Modal */}
+      {showResetPasswordModal && resetPasswordUser && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-md animate-fadeIn">
+            <div className="p-6 border-b border-gray-200">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-amber-100 rounded-full flex items-center justify-center">
+                    <KeyRound className="w-5 h-5 text-amber-600" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-semibold text-gray-900">Reset Password</h3>
+                    <p className="text-sm text-gray-500">
+                      {resetPasswordUser.first_name} {resetPasswordUser.last_name}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setShowResetPasswordModal(false)
+                    setResetPasswordUser(null)
+                    setNewPassword('')
+                    setConfirmPassword('')
+                  }}
+                  className="p-2 hover:bg-gray-100 rounded-lg"
+                >
+                  <X className="w-5 h-5 text-gray-500" />
+                </button>
+              </div>
+            </div>
+            <form onSubmit={submitResetPassword} className="p-6 space-y-4">
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
+                <p className="text-sm text-amber-700">
+                  <strong>User:</strong> {resetPasswordUser.email}
+                </p>
+                <p className="text-sm text-amber-700">
+                  <strong>Employee ID:</strong> {resetPasswordUser.employee_id}
+                </p>
+              </div>
+              
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  New Password
+                </label>
+                <div className="relative">
+                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+                  <input
+                    type={showNewPassword ? 'text' : 'password'}
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    className="input-field pl-10 pr-10"
+                    placeholder="Enter new password"
+                    required
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowNewPassword(!showNewPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                  >
+                    {showNewPassword ? <X className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+              
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Confirm Password
+                </label>
+                <div className="relative">
+                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+                  <input
+                    type={showNewPassword ? 'text' : 'password'}
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    className="input-field pl-10"
+                    placeholder="Confirm new password"
+                    required
+                  />
+                </div>
+              </div>
+              
+              <p className="text-xs text-gray-500">
+                Password must be at least 8 characters with uppercase, lowercase, number and special character (@$!%*?&)
+              </p>
+              
+              <div className="flex gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowResetPasswordModal(false)
+                    setResetPasswordUser(null)
+                    setNewPassword('')
+                    setConfirmPassword('')
+                  }}
+                  className="btn-secondary flex-1"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={resetPasswordMutation.isPending}
+                  className="btn-primary flex-1 flex items-center justify-center gap-2"
+                >
+                  {resetPasswordMutation.isPending ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      Resetting...
+                    </>
+                  ) : (
+                    <>
+                      <KeyRound className="w-4 h-4" />
+                      Reset Password
+                    </>
+                  )}
                 </button>
               </div>
             </form>

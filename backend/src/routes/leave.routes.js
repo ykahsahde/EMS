@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult } = require('express-validator');
-const { query, transaction } = require('../config/database');
+const prisma = require('../config/prisma');
 const { authenticate, authorize, canAccessEmployee } = require('../middleware/auth');
 const { leaveValidation } = require('../middleware/validators');
 const { createAuditLog } = require('../middleware/logger');
@@ -27,24 +27,30 @@ router.post('/apply', authenticate, leaveValidation.apply, async (req, res, next
         const totalDays = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
 
         // Check leave balance
-        const balanceResult = await query(
-            `SELECT * FROM leave_balances 
-             WHERE user_id = $1 AND year = EXTRACT(YEAR FROM $2::date)`,
-            [req.user.id, start_date]
-        );
+        const year = startDate.getFullYear();
+        const balance = await prisma.leaveBalance.findUnique({
+            where: {
+                userId_year: {
+                    userId: req.user.id,
+                    year: year
+                }
+            }
+        });
 
-        if (balanceResult.rows.length === 0) {
+        if (!balance) {
             return res.status(400).json({
                 success: false,
                 error: 'Leave balance not found for this year'
             });
         }
 
-        const balance = balanceResult.rows[0];
         const leaveTypeColumn = leave_type.toLowerCase();
-        
+
         if (leave_type !== 'UNPAID') {
-            const available = balance[`${leaveTypeColumn}_total`] - balance[`${leaveTypeColumn}_used`] - balance[`${leaveTypeColumn}_pending`];
+            const totalKey = `${leaveTypeColumn}Total`;
+            const usedKey = `${leaveTypeColumn}Used`;
+            const pendingKey = `${leaveTypeColumn}Pending`;
+            const available = (balance[totalKey] || 0) - (balance[usedKey] || 0) - (balance[pendingKey] || 0);
             if (totalDays > available) {
                 return res.status(400).json({
                     success: false,
@@ -54,51 +60,59 @@ router.post('/apply', authenticate, leaveValidation.apply, async (req, res, next
         }
 
         // Check for overlapping leave requests
-        const overlapResult = await query(
-            `SELECT * FROM leave_requests
-             WHERE user_id = $1 
-             AND status IN ('PENDING', 'APPROVED')
-             AND ((start_date <= $2 AND end_date >= $2) 
-                  OR (start_date <= $3 AND end_date >= $3)
-                  OR (start_date >= $2 AND end_date <= $3))`,
-            [req.user.id, start_date, end_date]
-        );
+        const overlapping = await prisma.leaveRequest.findFirst({
+            where: {
+                userId: req.user.id,
+                status: { in: ['PENDING', 'APPROVED'] },
+                OR: [
+                    { startDate: { lte: startDate }, endDate: { gte: startDate } },
+                    { startDate: { lte: endDate }, endDate: { gte: endDate } },
+                    { startDate: { gte: startDate }, endDate: { lte: endDate } }
+                ]
+            }
+        });
 
-        if (overlapResult.rows.length > 0) {
+        if (overlapping) {
             return res.status(400).json({
                 success: false,
                 error: 'You already have a leave request for overlapping dates'
             });
         }
 
-        const result = await transaction(async (client) => {
+        const result = await prisma.$transaction(async (tx) => {
             // Create leave request
-            const leaveResult = await client.query(
-                `INSERT INTO leave_requests 
-                 (user_id, leave_type, start_date, end_date, total_days, reason, attachment_url)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 RETURNING *`,
-                [req.user.id, leave_type, start_date, end_date, totalDays, reason, attachment_url]
-            );
+            const leaveRequest = await tx.leaveRequest.create({
+                data: {
+                    userId: req.user.id,
+                    leaveType: leave_type,
+                    startDate: startDate,
+                    endDate: endDate,
+                    totalDays: totalDays,
+                    reason: reason,
+                    attachmentUrl: attachment_url
+                }
+            });
 
             // Update pending leave balance
+            const updateData = {};
             if (leave_type !== 'UNPAID') {
-                await client.query(
-                    `UPDATE leave_balances 
-                     SET ${leaveTypeColumn}_pending = ${leaveTypeColumn}_pending + $1
-                     WHERE user_id = $2 AND year = EXTRACT(YEAR FROM $3::date)`,
-                    [totalDays, req.user.id, start_date]
-                );
+                const pendingKey = `${leaveTypeColumn}Pending`;
+                updateData[pendingKey] = { increment: totalDays };
             } else {
-                await client.query(
-                    `UPDATE leave_balances 
-                     SET unpaid_pending = unpaid_pending + $1
-                     WHERE user_id = $2 AND year = EXTRACT(YEAR FROM $3::date)`,
-                    [totalDays, req.user.id, start_date]
-                );
+                updateData.unpaidPending = { increment: totalDays };
             }
 
-            return leaveResult.rows[0];
+            await tx.leaveBalance.update({
+                where: {
+                    userId_year: {
+                        userId: req.user.id,
+                        year: year
+                    }
+                },
+                data: updateData
+            });
+
+            return leaveRequest;
         });
 
         await createAuditLog(req.user.id, 'CREATE', 'leave_requests', result.id, null,
@@ -107,7 +121,17 @@ router.post('/apply', authenticate, leaveValidation.apply, async (req, res, next
         res.status(201).json({
             success: true,
             message: 'Leave request submitted successfully',
-            data: result
+            data: {
+                id: result.id,
+                user_id: result.userId,
+                leave_type: result.leaveType,
+                start_date: result.startDate,
+                end_date: result.endDate,
+                total_days: result.totalDays,
+                reason: result.reason,
+                status: result.status,
+                created_at: result.createdAt
+            }
         });
     } catch (error) {
         next(error);
@@ -121,46 +145,81 @@ router.get('/my-leaves', authenticate, async (req, res, next) => {
         const currentYear = new Date().getFullYear();
         const nextYear = currentYear + 1;
 
-        let queryText = `
-            SELECT lr.*, 
-                   approver.first_name || ' ' || approver.last_name as approved_by_name
-            FROM leave_requests lr
-            LEFT JOIN users approver ON lr.approved_by = approver.id
-            WHERE lr.user_id = $1
-        `;
-        const params = [req.user.id];
+        let whereClause = { userId: req.user.id };
 
         // If specific year is provided, filter by that year
-        // Otherwise show current year and next year leaves
         if (year) {
-            queryText += ` AND EXTRACT(YEAR FROM lr.start_date) = $${params.length + 1}`;
-            params.push(year);
+            const yearStart = new Date(`${year}-01-01`);
+            const yearEnd = new Date(`${year}-12-31`);
+            whereClause.startDate = { gte: yearStart, lte: yearEnd };
         } else {
-            queryText += ` AND EXTRACT(YEAR FROM lr.start_date) IN ($${params.length + 1}, $${params.length + 2})`;
-            params.push(currentYear, nextYear);
+            // Show current year and next year leaves
+            const currentYearStart = new Date(`${currentYear}-01-01`);
+            const nextYearEnd = new Date(`${nextYear}-12-31`);
+            whereClause.startDate = { gte: currentYearStart, lte: nextYearEnd };
         }
 
         if (status) {
-            queryText += ` AND lr.status = $${params.length + 1}`;
-            params.push(status);
+            whereClause.status = status;
         }
 
-        queryText += ` ORDER BY lr.created_at DESC`;
-
-        const result = await query(queryText, params);
+        const requests = await prisma.leaveRequest.findMany({
+            where: whereClause,
+            include: {
+                approvedBy: {
+                    select: { firstName: true, lastName: true }
+                }
+            },
+            orderBy: { createdAt: 'desc' }
+        });
 
         // Get leave balance for the specified year or current year
-        const balanceYear = year || currentYear;
-        const balanceResult = await query(
-            `SELECT * FROM leave_balances WHERE user_id = $1 AND year = $2`,
-            [req.user.id, balanceYear]
-        );
+        const balanceYear = parseInt(year) || currentYear;
+        const balance = await prisma.leaveBalance.findUnique({
+            where: {
+                userId_year: {
+                    userId: req.user.id,
+                    year: balanceYear
+                }
+            }
+        });
 
         res.json({
             success: true,
             data: {
-                requests: result.rows,
-                balance: balanceResult.rows[0] || null
+                requests: requests.map(r => ({
+                    id: r.id,
+                    user_id: r.userId,
+                    leave_type: r.leaveType,
+                    start_date: r.startDate,
+                    end_date: r.endDate,
+                    total_days: r.totalDays,
+                    reason: r.reason,
+                    status: r.status,
+                    approved_by: r.approvedById,
+                    approved_at: r.approvedAt,
+                    rejection_reason: r.rejectionReason,
+                    attachment_url: r.attachmentUrl,
+                    created_at: r.createdAt,
+                    updated_at: r.updatedAt,
+                    approved_by_name: r.approvedBy ? `${r.approvedBy.firstName} ${r.approvedBy.lastName}` : null
+                })),
+                balance: balance ? {
+                    id: balance.id,
+                    user_id: balance.userId,
+                    year: balance.year,
+                    casual_total: balance.casualTotal,
+                    casual_used: balance.casualUsed,
+                    casual_pending: balance.casualPending,
+                    sick_total: balance.sickTotal,
+                    sick_used: balance.sickUsed,
+                    sick_pending: balance.sickPending,
+                    paid_total: balance.paidTotal,
+                    paid_used: balance.paidUsed,
+                    paid_pending: balance.paidPending,
+                    unpaid_used: balance.unpaidUsed,
+                    unpaid_pending: balance.unpaidPending
+                } : null
             }
         });
     } catch (error) {
@@ -169,41 +228,65 @@ router.get('/my-leaves', authenticate, async (req, res, next) => {
 });
 
 // Get pending leave requests (for Manager/GM/Admin)
-// HR cannot approve leaves - removed from authorize
 router.get('/pending', authenticate, authorize('MANAGER', 'ADMIN', 'GM'), async (req, res, next) => {
     try {
-        let queryText = `
-            SELECT lr.*, 
-                   u.employee_id, u.first_name, u.last_name, u.email, u.role as applicant_role,
-                   d.name as department_name
-            FROM leave_requests lr
-            JOIN users u ON lr.user_id = u.id
-            LEFT JOIN departments d ON u.department_id = d.id
-            WHERE lr.status = 'PENDING'
-            AND lr.user_id != $1
-        `;
-        const params = [req.user.id]; // Exclude own leave requests (prevent self-approval)
+        let whereClause = {
+            status: 'PENDING',
+            userId: { not: req.user.id }
+        };
 
-        // Manager can only see pending requests from their department EMPLOYEES only (not other Managers, Admin, GM)
+        // Manager can only see pending requests from their department EMPLOYEES only
         if (req.user.role === 'MANAGER') {
-            queryText += ` AND u.department_id = $2 AND u.role = 'EMPLOYEE'`;
-            params.push(req.user.department_id);
+            whereClause.user = {
+                departmentId: req.user.department_id,
+                role: 'EMPLOYEE'
+            };
         }
-        // Admin can see all leaves EXCEPT Admin and Manager leaves (those go to GM only)
+        // Admin can see all leaves EXCEPT Admin and Manager leaves
         else if (req.user.role === 'ADMIN') {
-            queryText += ` AND u.role NOT IN ('ADMIN', 'MANAGER', 'GM')`;
+            whereClause.user = {
+                role: { notIn: ['ADMIN', 'MANAGER', 'GM'] }
+            };
         }
-        // GM can see all pending leaves (including Manager and Admin leaves)
+        // GM can see all pending leaves
 
-        queryText += ` ORDER BY lr.created_at ASC`;
-
-        const result = await query(queryText, params);
+        const requests = await prisma.leaveRequest.findMany({
+            where: whereClause,
+            include: {
+                user: {
+                    select: {
+                        employeeId: true,
+                        firstName: true,
+                        lastName: true,
+                        email: true,
+                        role: true,
+                        department: { select: { name: true } }
+                    }
+                }
+            },
+            orderBy: { createdAt: 'asc' }
+        });
 
         res.json({
             success: true,
-            data: result.rows.map(req => ({
-                ...req,
-                employee_name: `${req.first_name} ${req.last_name}`
+            data: requests.map(r => ({
+                id: r.id,
+                user_id: r.userId,
+                leave_type: r.leaveType,
+                start_date: r.startDate,
+                end_date: r.endDate,
+                total_days: r.totalDays,
+                reason: r.reason,
+                status: r.status,
+                attachment_url: r.attachmentUrl,
+                created_at: r.createdAt,
+                employee_id: r.user.employeeId,
+                first_name: r.user.firstName,
+                last_name: r.user.lastName,
+                email: r.user.email,
+                applicant_role: r.user.role,
+                department_name: r.user.department?.name,
+                employee_name: `${r.user.firstName} ${r.user.lastName}`
             }))
         });
     } catch (error) {
@@ -211,7 +294,7 @@ router.get('/pending', authenticate, authorize('MANAGER', 'ADMIN', 'GM'), async 
     }
 });
 
-// Approve/Reject leave request (Manager, GM, Admin only - HR removed)
+// Approve/Reject leave request (Manager, GM, Admin only)
 router.patch('/:id/approve', authenticate, authorize('MANAGER', 'GM', 'ADMIN'), leaveValidation.approve, async (req, res, next) => {
     try {
         const errors = validationResult(req);
@@ -226,25 +309,28 @@ router.patch('/:id/approve', authenticate, authorize('MANAGER', 'GM', 'ADMIN'), 
         const { status, rejection_reason } = req.body;
 
         // Get leave request with applicant's role
-        const leaveResult = await query(
-            `SELECT lr.*, u.manager_id, u.department_id, u.role as applicant_role
-             FROM leave_requests lr
-             JOIN users u ON lr.user_id = u.id
-             WHERE lr.id = $1`,
-            [id]
-        );
+        const leaveRequest = await prisma.leaveRequest.findUnique({
+            where: { id },
+            include: {
+                user: {
+                    select: {
+                        managerId: true,
+                        departmentId: true,
+                        role: true
+                    }
+                }
+            }
+        });
 
-        if (leaveResult.rows.length === 0) {
+        if (!leaveRequest) {
             return res.status(404).json({
                 success: false,
                 error: 'Leave request not found'
             });
         }
 
-        const leaveRequest = leaveResult.rows[0];
-
         // RULE 1: Prevent self-approval
-        if (leaveRequest.user_id === req.user.id) {
+        if (leaveRequest.userId === req.user.id) {
             return res.status(403).json({
                 success: false,
                 error: 'You cannot approve your own leave request'
@@ -252,7 +338,7 @@ router.patch('/:id/approve', authenticate, authorize('MANAGER', 'GM', 'ADMIN'), 
         }
 
         // RULE 2: Admin leaves can ONLY be approved by GM
-        if (leaveRequest.applicant_role === 'ADMIN' && req.user.role !== 'GM') {
+        if (leaveRequest.user.role === 'ADMIN' && req.user.role !== 'GM') {
             return res.status(403).json({
                 success: false,
                 error: 'Admin leave requests can only be approved by GM'
@@ -260,22 +346,22 @@ router.patch('/:id/approve', authenticate, authorize('MANAGER', 'GM', 'ADMIN'), 
         }
 
         // RULE 2.5: Manager leaves can ONLY be approved by GM
-        if (leaveRequest.applicant_role === 'MANAGER' && req.user.role !== 'GM') {
+        if (leaveRequest.user.role === 'MANAGER' && req.user.role !== 'GM') {
             return res.status(403).json({
                 success: false,
                 error: 'Manager leave requests can only be approved by GM'
             });
         }
 
-        // RULE 3: Manager can only approve their department's EMPLOYEES (not admin/GM/Manager)
+        // RULE 3: Manager can only approve their department's EMPLOYEES
         if (req.user.role === 'MANAGER') {
-            if (leaveRequest.department_id !== req.user.department_id) {
+            if (leaveRequest.user.departmentId !== req.user.department_id) {
                 return res.status(403).json({
                     success: false,
                     error: 'You can only approve/reject leave requests of your department members'
                 });
             }
-            if (['ADMIN', 'GM', 'MANAGER'].includes(leaveRequest.applicant_role)) {
+            if (['ADMIN', 'GM', 'MANAGER'].includes(leaveRequest.user.role)) {
                 return res.status(403).json({
                     success: false,
                     error: 'Managers can only approve Employee leave requests'
@@ -284,7 +370,7 @@ router.patch('/:id/approve', authenticate, authorize('MANAGER', 'GM', 'ADMIN'), 
         }
 
         // RULE 4: Admin can approve any leave EXCEPT Admin and Manager leaves
-        if (req.user.role === 'ADMIN' && ['ADMIN', 'MANAGER'].includes(leaveRequest.applicant_role)) {
+        if (req.user.role === 'ADMIN' && ['ADMIN', 'MANAGER'].includes(leaveRequest.user.role)) {
             return res.status(403).json({
                 success: false,
                 error: 'Admin and Manager leave requests can only be approved by GM'
@@ -298,74 +384,92 @@ router.patch('/:id/approve', authenticate, authorize('MANAGER', 'GM', 'ADMIN'), 
             });
         }
 
-        const result = await transaction(async (client) => {
+        const result = await prisma.$transaction(async (tx) => {
             // Update leave request
-            const updateResult = await client.query(
-                `UPDATE leave_requests 
-                 SET status = $1, approved_by = $2, approved_at = NOW(), rejection_reason = $3
-                 WHERE id = $4
-                 RETURNING *`,
-                [status, req.user.id, rejection_reason || null, id]
-            );
+            const updatedRequest = await tx.leaveRequest.update({
+                where: { id },
+                data: {
+                    status: status,
+                    approvedById: req.user.id,
+                    approvedAt: new Date(),
+                    rejectionReason: rejection_reason || null
+                }
+            });
 
-            const leaveType = leaveRequest.leave_type.toLowerCase();
-            const totalDays = leaveRequest.total_days;
-            const year = new Date(leaveRequest.start_date).getFullYear();
+            const leaveType = leaveRequest.leaveType.toLowerCase();
+            const totalDays = leaveRequest.totalDays;
+            const year = new Date(leaveRequest.startDate).getFullYear();
 
             if (status === 'APPROVED') {
                 // Update leave balance - move from pending to used
-                if (leaveRequest.leave_type !== 'UNPAID') {
-                    await client.query(
-                        `UPDATE leave_balances 
-                         SET ${leaveType}_pending = ${leaveType}_pending - $1,
-                             ${leaveType}_used = ${leaveType}_used + $1
-                         WHERE user_id = $2 AND year = $3`,
-                        [totalDays, leaveRequest.user_id, year]
-                    );
+                const updateData = {};
+                if (leaveRequest.leaveType !== 'UNPAID') {
+                    const pendingKey = `${leaveType}Pending`;
+                    const usedKey = `${leaveType}Used`;
+                    updateData[pendingKey] = { decrement: totalDays };
+                    updateData[usedKey] = { increment: totalDays };
                 } else {
-                    await client.query(
-                        `UPDATE leave_balances 
-                         SET unpaid_pending = unpaid_pending - $1,
-                             unpaid_used = unpaid_used + $1
-                         WHERE user_id = $2 AND year = $3`,
-                        [totalDays, leaveRequest.user_id, year]
-                    );
+                    updateData.unpaidPending = { decrement: totalDays };
+                    updateData.unpaidUsed = { increment: totalDays };
                 }
 
+                await tx.leaveBalance.update({
+                    where: {
+                        userId_year: {
+                            userId: leaveRequest.userId,
+                            year: year
+                        }
+                    },
+                    data: updateData
+                });
+
                 // Mark attendance as ON_LEAVE for approved dates
-                const startDate = new Date(leaveRequest.start_date);
-                const endDate = new Date(leaveRequest.end_date);
-                
+                const startDate = new Date(leaveRequest.startDate);
+                const endDate = new Date(leaveRequest.endDate);
+
                 for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
                     const dateStr = d.toISOString().split('T')[0];
-                    await client.query(
-                        `INSERT INTO attendance_records (user_id, date, status, notes)
-                         VALUES ($1, $2, 'ON_LEAVE', $3)
-                         ON CONFLICT (user_id, date) 
-                         DO UPDATE SET status = 'ON_LEAVE', notes = $3`,
-                        [leaveRequest.user_id, dateStr, `Leave: ${leaveRequest.leave_type}`]
-                    );
+                    await tx.attendanceRecord.upsert({
+                        where: {
+                            userId_date: {
+                                userId: leaveRequest.userId,
+                                date: new Date(dateStr)
+                            }
+                        },
+                        update: {
+                            status: 'ON_LEAVE',
+                            notes: `Leave: ${leaveRequest.leaveType}`
+                        },
+                        create: {
+                            userId: leaveRequest.userId,
+                            date: new Date(dateStr),
+                            status: 'ON_LEAVE',
+                            notes: `Leave: ${leaveRequest.leaveType}`
+                        }
+                    });
                 }
             } else {
                 // Rejected - remove from pending
-                if (leaveRequest.leave_type !== 'UNPAID') {
-                    await client.query(
-                        `UPDATE leave_balances 
-                         SET ${leaveType}_pending = ${leaveType}_pending - $1
-                         WHERE user_id = $2 AND year = $3`,
-                        [totalDays, leaveRequest.user_id, year]
-                    );
+                const updateData = {};
+                if (leaveRequest.leaveType !== 'UNPAID') {
+                    const pendingKey = `${leaveType}Pending`;
+                    updateData[pendingKey] = { decrement: totalDays };
                 } else {
-                    await client.query(
-                        `UPDATE leave_balances 
-                         SET unpaid_pending = unpaid_pending - $1
-                         WHERE user_id = $2 AND year = $3`,
-                        [totalDays, leaveRequest.user_id, year]
-                    );
+                    updateData.unpaidPending = { decrement: totalDays };
                 }
+
+                await tx.leaveBalance.update({
+                    where: {
+                        userId_year: {
+                            userId: leaveRequest.userId,
+                            year: year
+                        }
+                    },
+                    data: updateData
+                });
             }
 
-            return updateResult.rows[0];
+            return updatedRequest;
         });
 
         await createAuditLog(req.user.id, 'UPDATE', 'leave_requests', id,
@@ -375,7 +479,13 @@ router.patch('/:id/approve', authenticate, authorize('MANAGER', 'GM', 'ADMIN'), 
         res.json({
             success: true,
             message: `Leave request ${status.toLowerCase()}`,
-            data: result
+            data: {
+                id: result.id,
+                status: result.status,
+                approved_by: result.approvedById,
+                approved_at: result.approvedAt,
+                rejection_reason: result.rejectionReason
+            }
         });
     } catch (error) {
         next(error);
@@ -387,19 +497,16 @@ router.patch('/:id/cancel', authenticate, async (req, res, next) => {
     try {
         const { id } = req.params;
 
-        const leaveResult = await query(
-            'SELECT * FROM leave_requests WHERE id = $1 AND user_id = $2',
-            [id, req.user.id]
-        );
+        const leaveRequest = await prisma.leaveRequest.findFirst({
+            where: { id, userId: req.user.id }
+        });
 
-        if (leaveResult.rows.length === 0) {
+        if (!leaveRequest) {
             return res.status(404).json({
                 success: false,
                 error: 'Leave request not found'
             });
         }
-
-        const leaveRequest = leaveResult.rows[0];
 
         if (leaveRequest.status !== 'PENDING') {
             return res.status(400).json({
@@ -408,34 +515,36 @@ router.patch('/:id/cancel', authenticate, async (req, res, next) => {
             });
         }
 
-        const result = await transaction(async (client) => {
+        const result = await prisma.$transaction(async (tx) => {
             // Update leave request
-            const updateResult = await client.query(
-                `UPDATE leave_requests SET status = 'CANCELLED' WHERE id = $1 RETURNING *`,
-                [id]
-            );
+            const updated = await tx.leaveRequest.update({
+                where: { id },
+                data: { status: 'CANCELLED' }
+            });
 
             // Restore leave balance
-            const leaveType = leaveRequest.leave_type.toLowerCase();
-            const year = new Date(leaveRequest.start_date).getFullYear();
+            const leaveType = leaveRequest.leaveType.toLowerCase();
+            const year = new Date(leaveRequest.startDate).getFullYear();
+            const updateData = {};
 
-            if (leaveRequest.leave_type !== 'UNPAID') {
-                await client.query(
-                    `UPDATE leave_balances 
-                     SET ${leaveType}_pending = ${leaveType}_pending - $1
-                     WHERE user_id = $2 AND year = $3`,
-                    [leaveRequest.total_days, req.user.id, year]
-                );
+            if (leaveRequest.leaveType !== 'UNPAID') {
+                const pendingKey = `${leaveType}Pending`;
+                updateData[pendingKey] = { decrement: leaveRequest.totalDays };
             } else {
-                await client.query(
-                    `UPDATE leave_balances 
-                     SET unpaid_pending = unpaid_pending - $1
-                     WHERE user_id = $2 AND year = $3`,
-                    [leaveRequest.total_days, req.user.id, year]
-                );
+                updateData.unpaidPending = { decrement: leaveRequest.totalDays };
             }
 
-            return updateResult.rows[0];
+            await tx.leaveBalance.update({
+                where: {
+                    userId_year: {
+                        userId: req.user.id,
+                        year: year
+                    }
+                },
+                data: updateData
+            });
+
+            return updated;
         });
 
         await createAuditLog(req.user.id, 'UPDATE', 'leave_requests', id,
@@ -445,7 +554,10 @@ router.patch('/:id/cancel', authenticate, async (req, res, next) => {
         res.json({
             success: true,
             message: 'Leave request cancelled',
-            data: result
+            data: {
+                id: result.id,
+                status: result.status
+            }
         });
     } catch (error) {
         next(error);
@@ -456,80 +568,75 @@ router.patch('/:id/cancel', authenticate, async (req, res, next) => {
 router.get('/', authenticate, authorize('ADMIN', 'HR', 'GM', 'MANAGER'), async (req, res, next) => {
     try {
         const { status, department_id, user_id, start_date, end_date, page = 1, limit = 20 } = req.query;
-        const offset = (page - 1) * limit;
+        const skip = (parseInt(page) - 1) * parseInt(limit);
 
-        let queryText = `
-            SELECT lr.*, 
-                   u.employee_id, u.first_name, u.last_name, u.email,
-                   d.name as department_name,
-                   approver.first_name || ' ' || approver.last_name as approved_by_name
-            FROM leave_requests lr
-            JOIN users u ON lr.user_id = u.id
-            LEFT JOIN departments d ON u.department_id = d.id
-            LEFT JOIN users approver ON lr.approved_by = approver.id
-            WHERE 1=1
-        `;
-        const params = [];
-        let paramCount = 0;
+        let whereClause = {};
 
         // Manager can only see their department's leave requests
         if (req.user.role === 'MANAGER') {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(req.user.department_id);
+            whereClause.user = { departmentId: req.user.department_id };
         } else if (department_id) {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(department_id);
+            whereClause.user = { departmentId: department_id };
         }
 
-        if (status) {
-            paramCount++;
-            queryText += ` AND lr.status = $${paramCount}`;
-            params.push(status);
-        }
+        if (status) whereClause.status = status;
+        if (user_id) whereClause.userId = user_id;
+        if (start_date) whereClause.startDate = { gte: new Date(start_date) };
+        if (end_date) whereClause.endDate = { lte: new Date(end_date) };
 
-        if (user_id) {
-            paramCount++;
-            queryText += ` AND lr.user_id = $${paramCount}`;
-            params.push(user_id);
-        }
-
-        if (start_date) {
-            paramCount++;
-            queryText += ` AND lr.start_date >= $${paramCount}`;
-            params.push(start_date);
-        }
-
-        if (end_date) {
-            paramCount++;
-            queryText += ` AND lr.end_date <= $${paramCount}`;
-            params.push(end_date);
-        }
-
-        // Get count
-        const countResult = await query(
-            queryText.replace(/SELECT .* FROM/, 'SELECT COUNT(*) FROM'),
-            params
-        );
-        const totalCount = parseInt(countResult.rows[0].count);
-
-        queryText += ` ORDER BY lr.created_at DESC LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
-        params.push(limit, offset);
-
-        const result = await query(queryText, params);
+        const [requests, totalCount] = await Promise.all([
+            prisma.leaveRequest.findMany({
+                where: whereClause,
+                include: {
+                    user: {
+                        select: {
+                            employeeId: true,
+                            firstName: true,
+                            lastName: true,
+                            email: true,
+                            department: { select: { name: true } }
+                        }
+                    },
+                    approvedBy: {
+                        select: { firstName: true, lastName: true }
+                    }
+                },
+                orderBy: { createdAt: 'desc' },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.leaveRequest.count({ where: whereClause })
+        ]);
 
         res.json({
             success: true,
-            data: result.rows.map(req => ({
-                ...req,
-                employee_name: `${req.first_name} ${req.last_name}`
+            data: requests.map(r => ({
+                id: r.id,
+                user_id: r.userId,
+                leave_type: r.leaveType,
+                start_date: r.startDate,
+                end_date: r.endDate,
+                total_days: r.totalDays,
+                reason: r.reason,
+                status: r.status,
+                approved_by: r.approvedById,
+                approved_at: r.approvedAt,
+                rejection_reason: r.rejectionReason,
+                created_at: r.createdAt,
+                updated_at: r.updatedAt,
+                employee_id: r.user.employeeId,
+                first_name: r.user.firstName,
+                last_name: r.user.lastName,
+                email: r.user.email,
+                department_name: r.user.department?.name,
+                approved_by_name: r.approvedBy ? `${r.approvedBy.firstName} ${r.approvedBy.lastName}` : null,
+                employee_name: `${r.user.firstName} ${r.user.lastName}`
             })),
             pagination: {
                 page: parseInt(page),
                 limit: parseInt(limit),
                 total: totalCount,
-                pages: Math.ceil(totalCount / limit)
+                pages: Math.ceil(totalCount / parseInt(limit))
             }
         });
     } catch (error) {
@@ -540,47 +647,55 @@ router.get('/', authenticate, authorize('ADMIN', 'HR', 'GM', 'MANAGER'), async (
 // Get current user's leave balance
 router.get('/balance/me', authenticate, async (req, res, next) => {
     try {
-        const year = req.query.year || new Date().getFullYear();
+        const year = parseInt(req.query.year) || new Date().getFullYear();
 
-        const result = await query(
-            `SELECT lb.*, 
-                    u.first_name, u.last_name, u.employee_id
-             FROM leave_balances lb
-             JOIN users u ON lb.user_id = u.id
-             WHERE lb.user_id = $1 AND lb.year = $2`,
-            [req.user.id, year]
-        );
+        let balance = await prisma.leaveBalance.findUnique({
+            where: {
+                userId_year: {
+                    userId: req.user.id,
+                    year: year
+                }
+            },
+            include: {
+                user: {
+                    select: { firstName: true, lastName: true, employeeId: true }
+                }
+            }
+        });
 
-        if (result.rows.length === 0) {
+        if (!balance) {
             // Create leave balance for this year if it doesn't exist
-            const createResult = await query(
-                `INSERT INTO leave_balances (user_id, year)
-                 VALUES ($1, $2)
-                 RETURNING *`,
-                [req.user.id, year]
-            );
-            
-            const balance = createResult.rows[0];
-            return res.json({
-                success: true,
+            balance = await prisma.leaveBalance.create({
                 data: {
-                    ...balance,
-                    casual_available: balance.casual_total - balance.casual_used - balance.casual_pending,
-                    sick_available: balance.sick_total - balance.sick_used - balance.sick_pending,
-                    paid_available: balance.paid_total - balance.paid_used - balance.paid_pending
+                    userId: req.user.id,
+                    year: year
                 }
             });
         }
 
-        const balance = result.rows[0];
-
         res.json({
             success: true,
             data: {
-                ...balance,
-                casual_available: balance.casual_total - balance.casual_used - balance.casual_pending,
-                sick_available: balance.sick_total - balance.sick_used - balance.sick_pending,
-                paid_available: balance.paid_total - balance.paid_used - balance.paid_pending
+                id: balance.id,
+                user_id: balance.userId,
+                year: balance.year,
+                casual_total: balance.casualTotal,
+                casual_used: balance.casualUsed,
+                casual_pending: balance.casualPending,
+                sick_total: balance.sickTotal,
+                sick_used: balance.sickUsed,
+                sick_pending: balance.sickPending,
+                paid_total: balance.paidTotal,
+                paid_used: balance.paidUsed,
+                paid_pending: balance.paidPending,
+                unpaid_used: balance.unpaidUsed,
+                unpaid_pending: balance.unpaidPending,
+                casual_available: (balance.casualTotal || 0) - (balance.casualUsed || 0) - (balance.casualPending || 0),
+                sick_available: (balance.sickTotal || 0) - (balance.sickUsed || 0) - (balance.sickPending || 0),
+                paid_available: (balance.paidTotal || 0) - (balance.paidUsed || 0) - (balance.paidPending || 0),
+                first_name: balance.user?.firstName,
+                last_name: balance.user?.lastName,
+                employee_id: balance.user?.employeeId
             }
         });
     } catch (error) {
@@ -592,33 +707,52 @@ router.get('/balance/me', authenticate, async (req, res, next) => {
 router.get('/balance/:userId', authenticate, canAccessEmployee, async (req, res, next) => {
     try {
         const { userId } = req.params;
-        const year = req.query.year || new Date().getFullYear();
+        const year = parseInt(req.query.year) || new Date().getFullYear();
 
-        const result = await query(
-            `SELECT lb.*, 
-                    u.first_name, u.last_name, u.employee_id
-             FROM leave_balances lb
-             JOIN users u ON lb.user_id = u.id
-             WHERE lb.user_id = $1 AND lb.year = $2`,
-            [userId, year]
-        );
+        const balance = await prisma.leaveBalance.findUnique({
+            where: {
+                userId_year: {
+                    userId: userId,
+                    year: year
+                }
+            },
+            include: {
+                user: {
+                    select: { firstName: true, lastName: true, employeeId: true }
+                }
+            }
+        });
 
-        if (result.rows.length === 0) {
+        if (!balance) {
             return res.status(404).json({
                 success: false,
                 error: 'Leave balance not found'
             });
         }
 
-        const balance = result.rows[0];
-
         res.json({
             success: true,
             data: {
-                ...balance,
-                casual_available: balance.casual_total - balance.casual_used - balance.casual_pending,
-                sick_available: balance.sick_total - balance.sick_used - balance.sick_pending,
-                paid_available: balance.paid_total - balance.paid_used - balance.paid_pending
+                id: balance.id,
+                user_id: balance.userId,
+                year: balance.year,
+                casual_total: balance.casualTotal,
+                casual_used: balance.casualUsed,
+                casual_pending: balance.casualPending,
+                sick_total: balance.sickTotal,
+                sick_used: balance.sickUsed,
+                sick_pending: balance.sickPending,
+                paid_total: balance.paidTotal,
+                paid_used: balance.paidUsed,
+                paid_pending: balance.paidPending,
+                unpaid_used: balance.unpaidUsed,
+                unpaid_pending: balance.unpaidPending,
+                casual_available: (balance.casualTotal || 0) - (balance.casualUsed || 0) - (balance.casualPending || 0),
+                sick_available: (balance.sickTotal || 0) - (balance.sickUsed || 0) - (balance.sickPending || 0),
+                paid_available: (balance.paidTotal || 0) - (balance.paidUsed || 0) - (balance.paidPending || 0),
+                first_name: balance.user?.firstName,
+                last_name: balance.user?.lastName,
+                employee_id: balance.user?.employeeId
             }
         });
     } catch (error) {

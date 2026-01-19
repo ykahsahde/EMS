@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult } = require('express-validator');
-const { query } = require('../config/database');
+const prisma = require('../config/prisma');
 const { authenticate, isAdmin } = require('../middleware/auth');
 const { shiftValidation } = require('../middleware/validators');
 const { createAuditLog } = require('../middleware/logger');
@@ -11,26 +11,38 @@ router.get('/', authenticate, async (req, res, next) => {
     try {
         const { is_active } = req.query;
 
-        let queryText = `
-            SELECT s.*, 
-                   COUNT(u.id) as employee_count
-            FROM shifts s
-            LEFT JOIN users u ON u.shift_id = s.id AND u.status = 'ACTIVE'
-        `;
-        const params = [];
+        const whereClause = is_active !== undefined
+            ? { isActive: is_active === 'true' }
+            : {};
 
-        if (is_active !== undefined) {
-            queryText += ` WHERE s.is_active = $1`;
-            params.push(is_active === 'true');
-        }
-
-        queryText += ` GROUP BY s.id ORDER BY s.start_time`;
-
-        const result = await query(queryText, params);
+        const shifts = await prisma.shift.findMany({
+            where: whereClause,
+            include: {
+                users: {
+                    where: { status: 'ACTIVE' },
+                    select: { id: true }
+                }
+            },
+            orderBy: { startTime: 'asc' }
+        });
 
         res.json({
             success: true,
-            data: result.rows
+            data: shifts.map(s => ({
+                id: s.id,
+                name: s.name,
+                code: s.code,
+                shift_type: s.shiftType,
+                start_time: s.startTime,
+                end_time: s.endTime,
+                grace_period_minutes: s.gracePeriodMinutes,
+                half_day_hours: s.halfDayHours,
+                full_day_hours: s.fullDayHours,
+                is_active: s.isActive,
+                created_at: s.createdAt,
+                updated_at: s.updatedAt,
+                employee_count: s.users.length
+            }))
         });
     } catch (error) {
         next(error);
@@ -42,9 +54,11 @@ router.get('/:id', authenticate, async (req, res, next) => {
     try {
         const { id } = req.params;
 
-        const result = await query('SELECT * FROM shifts WHERE id = $1', [id]);
+        const shift = await prisma.shift.findUnique({
+            where: { id }
+        });
 
-        if (result.rows.length === 0) {
+        if (!shift) {
             return res.status(404).json({
                 success: false,
                 error: 'Shift not found'
@@ -52,19 +66,42 @@ router.get('/:id', authenticate, async (req, res, next) => {
         }
 
         // Get employees in this shift
-        const employeesResult = await query(
-            `SELECT id, employee_id, first_name, last_name, email, department_id
-             FROM users WHERE shift_id = $1 AND status = 'ACTIVE' ORDER BY first_name`,
-            [id]
-        );
+        const employees = await prisma.user.findMany({
+            where: { shiftId: id, status: 'ACTIVE' },
+            select: {
+                id: true,
+                employeeId: true,
+                firstName: true,
+                lastName: true,
+                email: true,
+                departmentId: true
+            },
+            orderBy: { firstName: 'asc' }
+        });
 
         res.json({
             success: true,
             data: {
-                ...result.rows[0],
-                employees: employeesResult.rows.map(emp => ({
-                    ...emp,
-                    full_name: `${emp.first_name} ${emp.last_name}`
+                id: shift.id,
+                name: shift.name,
+                code: shift.code,
+                shift_type: shift.shiftType,
+                start_time: shift.startTime,
+                end_time: shift.endTime,
+                grace_period_minutes: shift.gracePeriodMinutes,
+                half_day_hours: shift.halfDayHours,
+                full_day_hours: shift.fullDayHours,
+                is_active: shift.isActive,
+                created_at: shift.createdAt,
+                updated_at: shift.updatedAt,
+                employees: employees.map(emp => ({
+                    id: emp.id,
+                    employee_id: emp.employeeId,
+                    first_name: emp.firstName,
+                    last_name: emp.lastName,
+                    email: emp.email,
+                    department_id: emp.departmentId,
+                    full_name: `${emp.firstName} ${emp.lastName}`
                 }))
             }
         });
@@ -86,20 +123,39 @@ router.post('/', authenticate, isAdmin, shiftValidation.create, async (req, res,
 
         const { name, code, shift_type, start_time, end_time, grace_period_minutes, half_day_hours, full_day_hours } = req.body;
 
-        const result = await query(
-            `INSERT INTO shifts (name, code, shift_type, start_time, end_time, grace_period_minutes, half_day_hours, full_day_hours)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             RETURNING *`,
-            [name, code, shift_type, start_time, end_time, grace_period_minutes || 15, half_day_hours || 4, full_day_hours || 8]
-        );
+        const shift = await prisma.shift.create({
+            data: {
+                name,
+                code,
+                shiftType: shift_type,
+                startTime: new Date(`1970-01-01T${start_time}`),
+                endTime: new Date(`1970-01-01T${end_time}`),
+                gracePeriodMinutes: grace_period_minutes || 15,
+                halfDayHours: half_day_hours || 4,
+                fullDayHours: full_day_hours || 8
+            }
+        });
 
-        await createAuditLog(req.user.id, 'CREATE', 'shifts', result.rows[0].id,
+        await createAuditLog(req.user.id, 'CREATE', 'shifts', shift.id,
             null, { name, code, shift_type }, 'Shift created', req.ip);
 
         res.status(201).json({
             success: true,
             message: 'Shift created successfully',
-            data: result.rows[0]
+            data: {
+                id: shift.id,
+                name: shift.name,
+                code: shift.code,
+                shift_type: shift.shiftType,
+                start_time: shift.startTime,
+                end_time: shift.endTime,
+                grace_period_minutes: shift.gracePeriodMinutes,
+                half_day_hours: shift.halfDayHours,
+                full_day_hours: shift.fullDayHours,
+                is_active: shift.isActive,
+                created_at: shift.createdAt,
+                updated_at: shift.updatedAt
+            }
         });
     } catch (error) {
         next(error);
@@ -113,37 +169,50 @@ router.put('/:id', authenticate, isAdmin, async (req, res, next) => {
         const { name, code, shift_type, start_time, end_time, grace_period_minutes, half_day_hours, full_day_hours, is_active } = req.body;
 
         // Get current data
-        const currentResult = await query('SELECT * FROM shifts WHERE id = $1', [id]);
-        if (currentResult.rows.length === 0) {
+        const currentShift = await prisma.shift.findUnique({ where: { id } });
+        if (!currentShift) {
             return res.status(404).json({
                 success: false,
                 error: 'Shift not found'
             });
         }
 
-        const result = await query(
-            `UPDATE shifts 
-             SET name = COALESCE($1, name),
-                 code = COALESCE($2, code),
-                 shift_type = COALESCE($3, shift_type),
-                 start_time = COALESCE($4, start_time),
-                 end_time = COALESCE($5, end_time),
-                 grace_period_minutes = COALESCE($6, grace_period_minutes),
-                 half_day_hours = COALESCE($7, half_day_hours),
-                 full_day_hours = COALESCE($8, full_day_hours),
-                 is_active = COALESCE($9, is_active)
-             WHERE id = $10
-             RETURNING *`,
-            [name, code, shift_type, start_time, end_time, grace_period_minutes, half_day_hours, full_day_hours, is_active, id]
-        );
+        const updateData = {};
+        if (name !== undefined) updateData.name = name;
+        if (code !== undefined) updateData.code = code;
+        if (shift_type !== undefined) updateData.shiftType = shift_type;
+        if (start_time !== undefined) updateData.startTime = new Date(`1970-01-01T${start_time}`);
+        if (end_time !== undefined) updateData.endTime = new Date(`1970-01-01T${end_time}`);
+        if (grace_period_minutes !== undefined) updateData.gracePeriodMinutes = grace_period_minutes;
+        if (half_day_hours !== undefined) updateData.halfDayHours = half_day_hours;
+        if (full_day_hours !== undefined) updateData.fullDayHours = full_day_hours;
+        if (is_active !== undefined) updateData.isActive = is_active;
+
+        const shift = await prisma.shift.update({
+            where: { id },
+            data: updateData
+        });
 
         await createAuditLog(req.user.id, 'UPDATE', 'shifts', id,
-            currentResult.rows[0], req.body, 'Shift updated', req.ip);
+            { name: currentShift.name, code: currentShift.code }, req.body, 'Shift updated', req.ip);
 
         res.json({
             success: true,
             message: 'Shift updated successfully',
-            data: result.rows[0]
+            data: {
+                id: shift.id,
+                name: shift.name,
+                code: shift.code,
+                shift_type: shift.shiftType,
+                start_time: shift.startTime,
+                end_time: shift.endTime,
+                grace_period_minutes: shift.gracePeriodMinutes,
+                half_day_hours: shift.halfDayHours,
+                full_day_hours: shift.fullDayHours,
+                is_active: shift.isActive,
+                created_at: shift.createdAt,
+                updated_at: shift.updatedAt
+            }
         });
     } catch (error) {
         next(error);
@@ -156,24 +225,22 @@ router.delete('/:id', authenticate, isAdmin, async (req, res, next) => {
         const { id } = req.params;
 
         // Check if shift has employees
-        const employeeCheck = await query(
-            'SELECT COUNT(*) FROM users WHERE shift_id = $1',
-            [id]
-        );
+        const employeeCount = await prisma.user.count({
+            where: { shiftId: id }
+        });
 
-        if (parseInt(employeeCheck.rows[0].count) > 0) {
+        if (employeeCount > 0) {
             return res.status(400).json({
                 success: false,
                 error: 'Cannot delete shift with assigned employees'
             });
         }
 
-        const result = await query(
-            'DELETE FROM shifts WHERE id = $1 RETURNING *',
-            [id]
-        );
+        const shift = await prisma.shift.delete({
+            where: { id }
+        }).catch(() => null);
 
-        if (result.rows.length === 0) {
+        if (!shift) {
             return res.status(404).json({
                 success: false,
                 error: 'Shift not found'
@@ -181,7 +248,7 @@ router.delete('/:id', authenticate, isAdmin, async (req, res, next) => {
         }
 
         await createAuditLog(req.user.id, 'DELETE', 'shifts', id,
-            result.rows[0], null, 'Shift deleted', req.ip);
+            { name: shift.name, code: shift.code }, null, 'Shift deleted', req.ip);
 
         res.json({
             success: true,
@@ -204,12 +271,19 @@ router.post('/assign', authenticate, isAdmin, async (req, res, next) => {
             });
         }
 
-        const result = await query(
-            `UPDATE users SET shift_id = $1 WHERE id = $2 RETURNING id, employee_id, first_name, last_name, shift_id`,
-            [shift_id, user_id]
-        );
+        const user = await prisma.user.update({
+            where: { id: user_id },
+            data: { shiftId: shift_id },
+            select: {
+                id: true,
+                employeeId: true,
+                firstName: true,
+                lastName: true,
+                shiftId: true
+            }
+        }).catch(() => null);
 
-        if (result.rows.length === 0) {
+        if (!user) {
             return res.status(404).json({
                 success: false,
                 error: 'User not found'
@@ -222,7 +296,13 @@ router.post('/assign', authenticate, isAdmin, async (req, res, next) => {
         res.json({
             success: true,
             message: 'Shift assigned successfully',
-            data: result.rows[0]
+            data: {
+                id: user.id,
+                employee_id: user.employeeId,
+                first_name: user.firstName,
+                last_name: user.lastName,
+                shift_id: user.shiftId
+            }
         });
     } catch (error) {
         next(error);

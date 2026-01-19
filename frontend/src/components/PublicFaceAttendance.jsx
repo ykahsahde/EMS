@@ -280,16 +280,25 @@ const PublicFaceAttendance = ({ onClose, onLoginClick }) => {
       if (!videoRef.current || !canvasRef.current || !modelsLoaded || !isCameraActive) return
 
       try {
+        const video = videoRef.current
+        const canvas = canvasRef.current
+        
+        // Double check refs are still valid
+        if (!video || !canvas) return
+
         const detections = await faceapi.detectSingleFace(
-          videoRef.current,
+          video,
           new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 })
         ).withFaceLandmarks()
 
-        const canvas = canvasRef.current
+        // Check again after async operation
+        if (!canvasRef.current) return
+
         const displaySize = { width: 640, height: 480 }
         faceapi.matchDimensions(canvas, displaySize)
 
         const ctx = canvas.getContext('2d')
+        if (!ctx) return
         ctx.clearRect(0, 0, canvas.width, canvas.height)
 
         if (detections) {

@@ -3,7 +3,7 @@ const router = express.Router();
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { query } = require('../config/database');
+const prisma = require('../config/prisma');
 const { authenticate, isHROrAdmin } = require('../middleware/auth');
 const { createAuditLog } = require('../middleware/logger');
 
@@ -49,8 +49,8 @@ router.post('/register', authenticate, upload.single('face_image'), async (req, 
 
         let descriptorData;
         try {
-            descriptorData = typeof face_descriptor === 'string' 
-                ? JSON.parse(face_descriptor) 
+            descriptorData = typeof face_descriptor === 'string'
+                ? JSON.parse(face_descriptor)
                 : face_descriptor;
         } catch (e) {
             return res.status(400).json({
@@ -59,13 +59,20 @@ router.post('/register', authenticate, upload.single('face_image'), async (req, 
             });
         }
 
-        const result = await query(
-            `UPDATE users 
-             SET face_descriptor = $1, face_registered_at = NOW()
-             WHERE id = $2
-             RETURNING id, employee_id, first_name, last_name, face_registered_at`,
-            [JSON.stringify(descriptorData), req.user.id]
-        );
+        const user = await prisma.user.update({
+            where: { id: req.user.id },
+            data: {
+                faceDescriptor: descriptorData,
+                faceRegisteredAt: new Date()
+            },
+            select: {
+                id: true,
+                employeeId: true,
+                firstName: true,
+                lastName: true,
+                faceRegisteredAt: true
+            }
+        });
 
         await createAuditLog(req.user.id, 'UPDATE', 'users', req.user.id,
             null, { action: 'face_registered' }, 'Face registered', req.ip);
@@ -74,7 +81,11 @@ router.post('/register', authenticate, upload.single('face_image'), async (req, 
             success: true,
             message: 'Face registered successfully',
             data: {
-                ...result.rows[0],
+                id: user.id,
+                employee_id: user.employeeId,
+                first_name: user.firstName,
+                last_name: user.lastName,
+                face_registered_at: user.faceRegisteredAt,
                 face_image_path: req.file?.filename
             }
         });
@@ -98,8 +109,8 @@ router.post('/register/:userId', authenticate, isHROrAdmin, upload.single('face_
 
         let descriptorData;
         try {
-            descriptorData = typeof face_descriptor === 'string' 
-                ? JSON.parse(face_descriptor) 
+            descriptorData = typeof face_descriptor === 'string'
+                ? JSON.parse(face_descriptor)
                 : face_descriptor;
         } catch (e) {
             return res.status(400).json({
@@ -109,21 +120,32 @@ router.post('/register/:userId', authenticate, isHROrAdmin, upload.single('face_
         }
 
         // Verify user exists
-        const userCheck = await query('SELECT id FROM users WHERE id = $1', [userId]);
-        if (userCheck.rows.length === 0) {
+        const existingUser = await prisma.user.findUnique({
+            where: { id: userId },
+            select: { id: true }
+        });
+
+        if (!existingUser) {
             return res.status(404).json({
                 success: false,
                 error: 'User not found'
             });
         }
 
-        const result = await query(
-            `UPDATE users 
-             SET face_descriptor = $1, face_registered_at = NOW()
-             WHERE id = $2
-             RETURNING id, employee_id, first_name, last_name, face_registered_at`,
-            [JSON.stringify(descriptorData), userId]
-        );
+        const user = await prisma.user.update({
+            where: { id: userId },
+            data: {
+                faceDescriptor: descriptorData,
+                faceRegisteredAt: new Date()
+            },
+            select: {
+                id: true,
+                employeeId: true,
+                firstName: true,
+                lastName: true,
+                faceRegisteredAt: true
+            }
+        });
 
         await createAuditLog(req.user.id, 'UPDATE', 'users', userId,
             null, { action: 'face_registered_by_admin' }, 'Face registered by admin/HR', req.ip);
@@ -131,7 +153,13 @@ router.post('/register/:userId', authenticate, isHROrAdmin, upload.single('face_
         res.json({
             success: true,
             message: 'Face registered successfully',
-            data: result.rows[0]
+            data: {
+                id: user.id,
+                employee_id: user.employeeId,
+                first_name: user.firstName,
+                last_name: user.lastName,
+                face_registered_at: user.faceRegisteredAt
+            }
         });
     } catch (error) {
         next(error);
@@ -151,21 +179,24 @@ router.post('/verify', authenticate, async (req, res, next) => {
         }
 
         // Get user's registered face
-        const userResult = await query(
-            'SELECT face_descriptor FROM users WHERE id = $1 AND face_registered_at IS NOT NULL',
-            [req.user.id]
-        );
+        const user = await prisma.user.findFirst({
+            where: {
+                id: req.user.id,
+                faceRegisteredAt: { not: null }
+            },
+            select: { faceDescriptor: true }
+        });
 
-        if (userResult.rows.length === 0 || !userResult.rows[0].face_descriptor) {
+        if (!user || !user.faceDescriptor) {
             return res.status(400).json({
                 success: false,
                 error: 'No registered face found. Please register your face first.'
             });
         }
 
-        const storedFaceData = userResult.rows[0].face_descriptor;
-        const inputDescriptor = typeof face_descriptor === 'string' 
-            ? JSON.parse(face_descriptor) 
+        const storedFaceData = user.faceDescriptor;
+        const inputDescriptor = typeof face_descriptor === 'string'
+            ? JSON.parse(face_descriptor)
             : face_descriptor;
 
         // Extract stored descriptors - support multiple formats
@@ -194,7 +225,7 @@ router.post('/verify', authenticate, async (req, res, next) => {
 
         for (const storedDescriptor of storedDescriptors) {
             if (!Array.isArray(storedDescriptor) || storedDescriptor.length !== 128) continue;
-            
+
             const distance = calculateEuclideanDistance(storedDescriptor, inputDescriptor);
             if (distance < bestDistance) {
                 bestDistance = distance;
@@ -223,16 +254,16 @@ router.post('/verify', authenticate, async (req, res, next) => {
 // Check if face is registered
 router.get('/status', authenticate, async (req, res, next) => {
     try {
-        const result = await query(
-            'SELECT face_registered_at FROM users WHERE id = $1',
-            [req.user.id]
-        );
+        const user = await prisma.user.findUnique({
+            where: { id: req.user.id },
+            select: { faceRegisteredAt: true }
+        });
 
         res.json({
             success: true,
             data: {
-                is_registered: !!result.rows[0]?.face_registered_at,
-                registered_at: result.rows[0]?.face_registered_at
+                is_registered: !!user?.faceRegisteredAt,
+                registered_at: user?.faceRegisteredAt
             }
         });
     } catch (error) {
@@ -245,13 +276,18 @@ router.get('/status/:userId', authenticate, isHROrAdmin, async (req, res, next) 
     try {
         const { userId } = req.params;
 
-        const result = await query(
-            `SELECT id, employee_id, first_name, last_name, face_registered_at
-             FROM users WHERE id = $1`,
-            [userId]
-        );
+        const user = await prisma.user.findUnique({
+            where: { id: userId },
+            select: {
+                id: true,
+                employeeId: true,
+                firstName: true,
+                lastName: true,
+                faceRegisteredAt: true
+            }
+        });
 
-        if (result.rows.length === 0) {
+        if (!user) {
             return res.status(404).json({
                 success: false,
                 error: 'User not found'
@@ -261,8 +297,12 @@ router.get('/status/:userId', authenticate, isHROrAdmin, async (req, res, next) 
         res.json({
             success: true,
             data: {
-                ...result.rows[0],
-                is_registered: !!result.rows[0].face_registered_at
+                id: user.id,
+                employee_id: user.employeeId,
+                first_name: user.firstName,
+                last_name: user.lastName,
+                face_registered_at: user.faceRegisteredAt,
+                is_registered: !!user.faceRegisteredAt
             }
         });
     } catch (error) {
@@ -275,15 +315,19 @@ router.delete('/register/:userId', authenticate, isHROrAdmin, async (req, res, n
     try {
         const { userId } = req.params;
 
-        const result = await query(
-            `UPDATE users 
-             SET face_descriptor = NULL, face_registered_at = NULL
-             WHERE id = $1
-             RETURNING id, employee_id`,
-            [userId]
-        );
+        const user = await prisma.user.update({
+            where: { id: userId },
+            data: {
+                faceDescriptor: null,
+                faceRegisteredAt: null
+            },
+            select: {
+                id: true,
+                employeeId: true
+            }
+        }).catch(() => null);
 
-        if (result.rows.length === 0) {
+        if (!user) {
             return res.status(404).json({
                 success: false,
                 error: 'User not found'
@@ -291,7 +335,7 @@ router.delete('/register/:userId', authenticate, isHROrAdmin, async (req, res, n
         }
 
         await createAuditLog(req.user.id, 'UPDATE', 'users', userId,
-            { face_registered: true }, { face_registered: false }, 
+            { face_registered: true }, { face_registered: false },
             'Face registration removed', req.ip);
 
         res.json({
@@ -308,33 +352,47 @@ router.get('/registered-users', authenticate, isHROrAdmin, async (req, res, next
     try {
         const { registered } = req.query;
 
-        let queryText = `
-            SELECT id, employee_id, first_name, last_name, email, 
-                   department_id, face_registered_at
-            FROM users WHERE status = 'ACTIVE'
-        `;
+        let whereClause = { status: 'ACTIVE' };
 
         if (registered === 'true') {
-            queryText += ` AND face_registered_at IS NOT NULL`;
+            whereClause.faceRegisteredAt = { not: null };
         } else if (registered === 'false') {
-            queryText += ` AND face_registered_at IS NULL`;
+            whereClause.faceRegisteredAt = null;
         }
 
-        queryText += ` ORDER BY first_name`;
+        const users = await prisma.user.findMany({
+            where: whereClause,
+            select: {
+                id: true,
+                employeeId: true,
+                firstName: true,
+                lastName: true,
+                email: true,
+                departmentId: true,
+                faceRegisteredAt: true
+            },
+            orderBy: { firstName: 'asc' }
+        });
 
-        const result = await query(queryText);
+        const registeredCount = users.filter(u => u.faceRegisteredAt).length;
 
         res.json({
             success: true,
-            data: result.rows.map(u => ({
-                ...u,
-                full_name: `${u.first_name} ${u.last_name}`,
-                is_registered: !!u.face_registered_at
+            data: users.map(u => ({
+                id: u.id,
+                employee_id: u.employeeId,
+                first_name: u.firstName,
+                last_name: u.lastName,
+                email: u.email,
+                department_id: u.departmentId,
+                face_registered_at: u.faceRegisteredAt,
+                full_name: `${u.firstName} ${u.lastName}`,
+                is_registered: !!u.faceRegisteredAt
             })),
             summary: {
-                total: result.rows.length,
-                registered: result.rows.filter(u => u.face_registered_at).length,
-                not_registered: result.rows.filter(u => !u.face_registered_at).length
+                total: users.length,
+                registered: registeredCount,
+                not_registered: users.length - registeredCount
             }
         });
     } catch (error) {

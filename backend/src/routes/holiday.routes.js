@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { validationResult } = require('express-validator');
-const { query } = require('../config/database');
+const prisma = require('../config/prisma');
 const { authenticate, isAdmin } = require('../middleware/auth');
 const { holidayValidation } = require('../middleware/validators');
 const { createAuditLog } = require('../middleware/logger');
@@ -10,21 +10,35 @@ const { createAuditLog } = require('../middleware/logger');
 router.get('/', authenticate, async (req, res, next) => {
     try {
         const { year } = req.query;
-        const targetYear = year || new Date().getFullYear();
+        const targetYear = parseInt(year) || new Date().getFullYear();
 
-        const result = await query(
-            `SELECT h.*, 
-                    creator.first_name || ' ' || creator.last_name as created_by_name
-             FROM holidays h
-             LEFT JOIN users creator ON h.created_by = creator.id
-             WHERE h.year = $1
-             ORDER BY h.date`,
-            [targetYear]
-        );
+        const holidays = await prisma.holiday.findMany({
+            where: { year: targetYear },
+            include: {
+                createdBy: {
+                    select: {
+                        firstName: true,
+                        lastName: true
+                    }
+                }
+            },
+            orderBy: { date: 'asc' }
+        });
 
         res.json({
             success: true,
-            data: result.rows,
+            data: holidays.map(h => ({
+                id: h.id,
+                name: h.name,
+                date: h.date,
+                description: h.description,
+                is_optional: h.isOptional,
+                year: h.year,
+                created_by: h.createdById,
+                created_at: h.createdAt,
+                updated_at: h.updatedAt,
+                created_by_name: h.createdBy ? `${h.createdBy.firstName} ${h.createdBy.lastName}` : null
+            })),
             year: targetYear
         });
     } catch (error) {
@@ -35,16 +49,29 @@ router.get('/', authenticate, async (req, res, next) => {
 // Get upcoming holidays
 router.get('/upcoming', authenticate, async (req, res, next) => {
     try {
-        const result = await query(
-            `SELECT * FROM holidays
-             WHERE date >= CURRENT_DATE
-             ORDER BY date
-             LIMIT 10`
-        );
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        const holidays = await prisma.holiday.findMany({
+            where: {
+                date: { gte: today }
+            },
+            orderBy: { date: 'asc' },
+            take: 10
+        });
 
         res.json({
             success: true,
-            data: result.rows
+            data: holidays.map(h => ({
+                id: h.id,
+                name: h.name,
+                date: h.date,
+                description: h.description,
+                is_optional: h.isOptional,
+                year: h.year,
+                created_at: h.createdAt,
+                updated_at: h.updatedAt
+            }))
         });
     } catch (error) {
         next(error);
@@ -56,15 +83,21 @@ router.get('/check/:date', authenticate, async (req, res, next) => {
     try {
         const { date } = req.params;
 
-        const result = await query(
-            'SELECT * FROM holidays WHERE date = $1',
-            [date]
-        );
+        const holiday = await prisma.holiday.findUnique({
+            where: { date: new Date(date) }
+        });
 
         res.json({
             success: true,
-            is_holiday: result.rows.length > 0,
-            data: result.rows[0] || null
+            is_holiday: !!holiday,
+            data: holiday ? {
+                id: holiday.id,
+                name: holiday.name,
+                date: holiday.date,
+                description: holiday.description,
+                is_optional: holiday.isOptional,
+                year: holiday.year
+            } : null
         });
     } catch (error) {
         next(error);
@@ -85,20 +118,34 @@ router.post('/', authenticate, isAdmin, holidayValidation.create, async (req, re
         const { name, date, description, is_optional } = req.body;
         const year = new Date(date).getFullYear();
 
-        const result = await query(
-            `INSERT INTO holidays (name, date, description, is_optional, year, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING *`,
-            [name, date, description, is_optional || false, year, req.user.id]
-        );
+        const holiday = await prisma.holiday.create({
+            data: {
+                name,
+                date: new Date(date),
+                description,
+                isOptional: is_optional || false,
+                year,
+                createdById: req.user.id
+            }
+        });
 
-        await createAuditLog(req.user.id, 'CREATE', 'holidays', result.rows[0].id,
+        await createAuditLog(req.user.id, 'CREATE', 'holidays', holiday.id,
             null, { name, date }, 'Holiday created', req.ip);
 
         res.status(201).json({
             success: true,
             message: 'Holiday created successfully',
-            data: result.rows[0]
+            data: {
+                id: holiday.id,
+                name: holiday.name,
+                date: holiday.date,
+                description: holiday.description,
+                is_optional: holiday.isOptional,
+                year: holiday.year,
+                created_by: holiday.createdById,
+                created_at: holiday.createdAt,
+                updated_at: holiday.updatedAt
+            }
         });
     } catch (error) {
         next(error);
@@ -112,35 +159,43 @@ router.put('/:id', authenticate, isAdmin, async (req, res, next) => {
         const { name, date, description, is_optional } = req.body;
 
         // Get current data
-        const currentResult = await query('SELECT * FROM holidays WHERE id = $1', [id]);
-        if (currentResult.rows.length === 0) {
+        const currentHoliday = await prisma.holiday.findUnique({ where: { id } });
+        if (!currentHoliday) {
             return res.status(404).json({
                 success: false,
                 error: 'Holiday not found'
             });
         }
 
-        const year = date ? new Date(date).getFullYear() : currentResult.rows[0].year;
+        const year = date ? new Date(date).getFullYear() : currentHoliday.year;
 
-        const result = await query(
-            `UPDATE holidays 
-             SET name = COALESCE($1, name),
-                 date = COALESCE($2, date),
-                 description = COALESCE($3, description),
-                 is_optional = COALESCE($4, is_optional),
-                 year = $5
-             WHERE id = $6
-             RETURNING *`,
-            [name, date, description, is_optional, year, id]
-        );
+        const updateData = { year };
+        if (name !== undefined) updateData.name = name;
+        if (date !== undefined) updateData.date = new Date(date);
+        if (description !== undefined) updateData.description = description;
+        if (is_optional !== undefined) updateData.isOptional = is_optional;
+
+        const holiday = await prisma.holiday.update({
+            where: { id },
+            data: updateData
+        });
 
         await createAuditLog(req.user.id, 'UPDATE', 'holidays', id,
-            currentResult.rows[0], req.body, 'Holiday updated', req.ip);
+            { name: currentHoliday.name, date: currentHoliday.date }, req.body, 'Holiday updated', req.ip);
 
         res.json({
             success: true,
             message: 'Holiday updated successfully',
-            data: result.rows[0]
+            data: {
+                id: holiday.id,
+                name: holiday.name,
+                date: holiday.date,
+                description: holiday.description,
+                is_optional: holiday.isOptional,
+                year: holiday.year,
+                created_at: holiday.createdAt,
+                updated_at: holiday.updatedAt
+            }
         });
     } catch (error) {
         next(error);
@@ -152,12 +207,11 @@ router.delete('/:id', authenticate, isAdmin, async (req, res, next) => {
     try {
         const { id } = req.params;
 
-        const result = await query(
-            'DELETE FROM holidays WHERE id = $1 RETURNING *',
-            [id]
-        );
+        const holiday = await prisma.holiday.delete({
+            where: { id }
+        }).catch(() => null);
 
-        if (result.rows.length === 0) {
+        if (!holiday) {
             return res.status(404).json({
                 success: false,
                 error: 'Holiday not found'
@@ -165,7 +219,7 @@ router.delete('/:id', authenticate, isAdmin, async (req, res, next) => {
         }
 
         await createAuditLog(req.user.id, 'DELETE', 'holidays', id,
-            result.rows[0], null, 'Holiday deleted', req.ip);
+            { name: holiday.name, date: holiday.date }, null, 'Holiday deleted', req.ip);
 
         res.json({
             success: true,
@@ -194,14 +248,29 @@ router.post('/bulk', authenticate, isAdmin, async (req, res, next) => {
             const year = new Date(date).getFullYear();
 
             try {
-                const result = await query(
-                    `INSERT INTO holidays (name, date, description, is_optional, year, created_by)
-                     VALUES ($1, $2, $3, $4, $5, $6)
-                     ON CONFLICT (date) DO UPDATE SET name = $1, description = $3
-                     RETURNING *`,
-                    [name, date, description, is_optional || false, year, req.user.id]
-                );
-                results.push({ success: true, data: result.rows[0] });
+                const result = await prisma.holiday.upsert({
+                    where: { date: new Date(date) },
+                    update: { name, description },
+                    create: {
+                        name,
+                        date: new Date(date),
+                        description,
+                        isOptional: is_optional || false,
+                        year,
+                        createdById: req.user.id
+                    }
+                });
+                results.push({
+                    success: true,
+                    data: {
+                        id: result.id,
+                        name: result.name,
+                        date: result.date,
+                        description: result.description,
+                        is_optional: result.isOptional,
+                        year: result.year
+                    }
+                });
             } catch (err) {
                 results.push({ success: false, error: err.message, holiday });
             }

@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const { validationResult } = require('express-validator');
-const { query, transaction } = require('../config/database');
+const prisma = require('../config/prisma');
 const { authenticate, authorize, isAdmin, isHROrAdmin, isGMOrAdmin, isManagerOrAbove, canAccessEmployee } = require('../middleware/auth');
 const { userValidation } = require('../middleware/validators');
 const { createAuditLog } = require('../middleware/logger');
@@ -14,39 +14,39 @@ const canManageUsers = authorize('ADMIN', 'HR', 'GM', 'MANAGER');
 router.get('/next-employee-id/:departmentId', authenticate, canManageUsers, async (req, res, next) => {
     try {
         const { departmentId } = req.params;
-        
+
         // Get department code
-        const deptResult = await query(
-            'SELECT code FROM departments WHERE id = $1',
-            [departmentId]
-        );
-        
-        if (deptResult.rows.length === 0) {
+        const dept = await prisma.department.findUnique({
+            where: { id: departmentId },
+            select: { code: true }
+        });
+
+        if (!dept) {
             return res.status(404).json({
                 success: false,
                 error: 'Department not found'
             });
         }
-        
-        const deptCode = deptResult.rows[0].code;
-        
+
+        const deptCode = dept.code;
+
         // Get the highest employee ID number for this department
-        const maxIdResult = await query(
-            `SELECT employee_id FROM users 
-             WHERE employee_id LIKE $1 
-             ORDER BY employee_id DESC LIMIT 1`,
-            [deptCode + '%']
-        );
-        
+        const lastUser = await prisma.user.findFirst({
+            where: {
+                employeeId: { startsWith: deptCode }
+            },
+            orderBy: { employeeId: 'desc' },
+            select: { employeeId: true }
+        });
+
         let nextNumber = 1;
-        if (maxIdResult.rows.length > 0) {
-            const lastId = maxIdResult.rows[0].employee_id;
-            const numPart = lastId.replace(deptCode, '');
+        if (lastUser) {
+            const numPart = lastUser.employeeId.replace(deptCode, '');
             nextNumber = parseInt(numPart, 10) + 1;
         }
-        
+
         const nextEmployeeId = deptCode + nextNumber.toString().padStart(3, '0');
-        
+
         res.json({
             success: true,
             data: {
@@ -63,79 +63,75 @@ router.get('/next-employee-id/:departmentId', authenticate, canManageUsers, asyn
 router.get('/', authenticate, canManageUsers, async (req, res, next) => {
     try {
         const { department_id, role, status, search, page = 1, limit = 20 } = req.query;
-        const offset = (page - 1) * limit;
-        
-        let queryText = `
-            SELECT u.id, u.employee_id, u.email, u.first_name, u.last_name, u.phone,
-                   u.role, u.status, u.date_of_joining, u.profile_picture_url,
-                   u.face_registered_at, u.last_login, u.created_at, u.department_id,
-                   d.name as department_name, s.name as shift_name,
-                   m.first_name || ' ' || m.last_name as manager_name, u.manager_id
-            FROM users u
-            LEFT JOIN departments d ON u.department_id = d.id
-            LEFT JOIN shifts s ON u.shift_id = s.id
-            LEFT JOIN users m ON u.manager_id = m.id
-            WHERE 1=1
-        `;
-        const params = [];
-        let paramCount = 0;
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        let whereClause = {};
 
         // Manager can only see employees in their department or their direct reports
         if (req.user.role === 'MANAGER') {
-            paramCount++;
-            queryText += ` AND (u.department_id = $${paramCount} OR u.manager_id = $${paramCount + 1})`;
-            params.push(req.user.department_id, req.user.id);
-            paramCount++;
+            whereClause.OR = [
+                { departmentId: req.user.department_id },
+                { managerId: req.user.id }
+            ];
         } else if (department_id) {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(department_id);
+            whereClause.departmentId = department_id;
         }
 
-        if (role) {
-            paramCount++;
-            queryText += ` AND u.role = $${paramCount}`;
-            params.push(role);
-        }
-
-        if (status) {
-            paramCount++;
-            queryText += ` AND u.status = $${paramCount}`;
-            params.push(status);
-        }
-
+        if (role) whereClause.role = role;
+        if (status) whereClause.status = status;
         if (search) {
-            paramCount++;
-            queryText += ` AND (u.first_name ILIKE $${paramCount} OR u.last_name ILIKE $${paramCount} 
-                          OR u.email ILIKE $${paramCount} OR u.employee_id ILIKE $${paramCount})`;
-            params.push(`%${search}%`);
+            whereClause.OR = [
+                { firstName: { contains: search, mode: 'insensitive' } },
+                { lastName: { contains: search, mode: 'insensitive' } },
+                { email: { contains: search, mode: 'insensitive' } },
+                { employeeId: { contains: search, mode: 'insensitive' } }
+            ];
         }
 
-        // Get total count
-        const countResult = await query(
-            queryText.replace(/SELECT .* FROM/, 'SELECT COUNT(*) FROM'),
-            params
-        );
-        const totalCount = parseInt(countResult.rows[0].count);
-
-        // Add pagination
-        queryText += ` ORDER BY u.created_at DESC LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
-        params.push(limit, offset);
-
-        const result = await query(queryText, params);
+        const [users, totalCount] = await Promise.all([
+            prisma.user.findMany({
+                where: whereClause,
+                include: {
+                    department: { select: { name: true } },
+                    shift: { select: { name: true } },
+                    manager: { select: { firstName: true, lastName: true } }
+                },
+                orderBy: { createdAt: 'desc' },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.user.count({ where: whereClause })
+        ]);
 
         res.json({
             success: true,
-            data: result.rows.map(user => ({
-                ...user,
-                full_name: `${user.first_name} ${user.last_name}`,
-                face_registered: !!user.face_registered_at
+            data: users.map(user => ({
+                id: user.id,
+                employee_id: user.employeeId,
+                email: user.email,
+                first_name: user.firstName,
+                last_name: user.lastName,
+                phone: user.phone,
+                role: user.role,
+                status: user.status,
+                date_of_joining: user.dateOfJoining,
+                profile_picture_url: user.profilePictureUrl,
+                face_registered_at: user.faceRegisteredAt,
+                last_login: user.lastLogin,
+                created_at: user.createdAt,
+                department_id: user.departmentId,
+                department_name: user.department?.name,
+                shift_name: user.shift?.name,
+                manager_name: user.manager ? `${user.manager.firstName} ${user.manager.lastName}` : null,
+                manager_id: user.managerId,
+                full_name: `${user.firstName} ${user.lastName}`,
+                face_registered: !!user.faceRegisteredAt
             })),
             pagination: {
                 page: parseInt(page),
                 limit: parseInt(limit),
                 total: totalCount,
-                pages: Math.ceil(totalCount / limit)
+                pages: Math.ceil(totalCount / parseInt(limit))
             }
         });
     } catch (error) {
@@ -148,34 +144,51 @@ router.get('/:id', authenticate, canAccessEmployee, async (req, res, next) => {
     try {
         const { id } = req.params;
 
-        const result = await query(
-            `SELECT u.*, d.name as department_name, s.name as shift_name,
-                    m.first_name || ' ' || m.last_name as manager_name, m.email as manager_email
-             FROM users u
-             LEFT JOIN departments d ON u.department_id = d.id
-             LEFT JOIN shifts s ON u.shift_id = s.id
-             LEFT JOIN users m ON u.manager_id = m.id
-             WHERE u.id = $1`,
-            [id]
-        );
+        const user = await prisma.user.findUnique({
+            where: { id },
+            include: {
+                department: { select: { name: true } },
+                shift: { select: { name: true } },
+                manager: { select: { firstName: true, lastName: true, email: true } }
+            }
+        });
 
-        if (result.rows.length === 0) {
+        if (!user) {
             return res.status(404).json({
                 success: false,
                 error: 'User not found'
             });
         }
 
-        const user = result.rows[0];
-        delete user.password_hash;
-        delete user.face_descriptor;
-
         res.json({
             success: true,
             data: {
-                ...user,
-                full_name: `${user.first_name} ${user.last_name}`,
-                face_registered: !!user.face_registered_at
+                id: user.id,
+                employee_id: user.employeeId,
+                email: user.email,
+                first_name: user.firstName,
+                last_name: user.lastName,
+                phone: user.phone,
+                role: user.role,
+                status: user.status,
+                department_id: user.departmentId,
+                shift_id: user.shiftId,
+                manager_id: user.managerId,
+                date_of_joining: user.dateOfJoining,
+                date_of_birth: user.dateOfBirth,
+                address: user.address,
+                emergency_contact: user.emergencyContact,
+                profile_picture_url: user.profilePictureUrl,
+                face_registered_at: user.faceRegisteredAt,
+                last_login: user.lastLogin,
+                created_at: user.createdAt,
+                updated_at: user.updatedAt,
+                department_name: user.department?.name,
+                shift_name: user.shift?.name,
+                manager_name: user.manager ? `${user.manager.firstName} ${user.manager.lastName}` : null,
+                manager_email: user.manager?.email,
+                full_name: `${user.firstName} ${user.lastName}`,
+                face_registered: !!user.faceRegisteredAt
             }
         });
     } catch (error) {
@@ -230,101 +243,115 @@ router.post('/', authenticate, canManageUsers, userValidation.create, async (req
         // Auto-generate employee ID based on department
         let employee_id;
         if (finalDepartmentId) {
-            // Get department code
-            const deptResult = await query(
-                'SELECT code FROM departments WHERE id = $1',
-                [finalDepartmentId]
-            );
-            
-            if (deptResult.rows.length > 0) {
-                const deptCode = deptResult.rows[0].code;
-                
-                // Get the highest employee ID number for this department
-                const maxIdResult = await query(
-                    `SELECT employee_id FROM users 
-                     WHERE employee_id LIKE $1 
-                     ORDER BY employee_id DESC LIMIT 1`,
-                    [deptCode + '%']
-                );
-                
+            const dept = await prisma.department.findUnique({
+                where: { id: finalDepartmentId },
+                select: { code: true }
+            });
+
+            if (dept) {
+                const deptCode = dept.code;
+                const lastUser = await prisma.user.findFirst({
+                    where: { employeeId: { startsWith: deptCode } },
+                    orderBy: { employeeId: 'desc' },
+                    select: { employeeId: true }
+                });
+
                 let nextNumber = 1;
-                if (maxIdResult.rows.length > 0) {
-                    const lastId = maxIdResult.rows[0].employee_id;
-                    // Extract the number part (e.g., from HR005, extract 5)
-                    const numPart = lastId.replace(deptCode, '');
+                if (lastUser) {
+                    const numPart = lastUser.employeeId.replace(deptCode, '');
                     nextNumber = parseInt(numPart, 10) + 1;
                 }
-                
-                // Generate new employee ID with 3 digits padding (e.g., HR001, IT002)
                 employee_id = deptCode + nextNumber.toString().padStart(3, '0');
             } else {
-                // Fallback if department not found - use generic ID
-                const maxGenericResult = await query(
-                    `SELECT employee_id FROM users 
-                     WHERE employee_id LIKE 'EMP%' 
-                     ORDER BY employee_id DESC LIMIT 1`
-                );
+                const lastGeneric = await prisma.user.findFirst({
+                    where: { employeeId: { startsWith: 'EMP' } },
+                    orderBy: { employeeId: 'desc' },
+                    select: { employeeId: true }
+                });
                 let nextNumber = 1;
-                if (maxGenericResult.rows.length > 0) {
-                    const lastId = maxGenericResult.rows[0].employee_id;
-                    const numPart = lastId.replace('EMP', '');
+                if (lastGeneric) {
+                    const numPart = lastGeneric.employeeId.replace('EMP', '');
                     nextNumber = parseInt(numPart, 10) + 1;
                 }
                 employee_id = 'EMP' + nextNumber.toString().padStart(3, '0');
             }
         } else {
-            // No department - use generic EMP prefix
-            const maxGenericResult = await query(
-                `SELECT employee_id FROM users 
-                 WHERE employee_id LIKE 'EMP%' 
-                 ORDER BY employee_id DESC LIMIT 1`
-            );
+            const lastGeneric = await prisma.user.findFirst({
+                where: { employeeId: { startsWith: 'EMP' } },
+                orderBy: { employeeId: 'desc' },
+                select: { employeeId: true }
+            });
             let nextNumber = 1;
-            if (maxGenericResult.rows.length > 0) {
-                const lastId = maxGenericResult.rows[0].employee_id;
-                const numPart = lastId.replace('EMP', '');
+            if (lastGeneric) {
+                const numPart = lastGeneric.employeeId.replace('EMP', '');
                 nextNumber = parseInt(numPart, 10) + 1;
             }
             employee_id = 'EMP' + nextNumber.toString().padStart(3, '0');
         }
 
         // Default date_of_joining to today if not provided
-        const finalDateOfJoining = date_of_joining || new Date().toISOString().split('T')[0];
+        const finalDateOfJoining = date_of_joining ? new Date(date_of_joining) : new Date();
 
         // Hash password
         const password_hash = await bcrypt.hash(password, 12);
 
-        const result = await transaction(async (client) => {
+        const result = await prisma.$transaction(async (tx) => {
             // Create user
-            const userResult = await client.query(
-                `INSERT INTO users (employee_id, email, password_hash, first_name, last_name, phone,
-                                   role, department_id, shift_id, manager_id, date_of_joining,
-                                   date_of_birth, address, emergency_contact, created_by)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-                 RETURNING id, employee_id, email, first_name, last_name, role, status`,
-                [employee_id, email, password_hash, first_name, last_name, phone,
-                 role || 'EMPLOYEE', finalDepartmentId, shift_id, manager_id || (req.user.role === 'MANAGER' ? req.user.id : null), finalDateOfJoining,
-                 date_of_birth, address, emergency_contact, req.user.id]
-            );
-
-            const newUser = userResult.rows[0];
+            const newUser = await tx.user.create({
+                data: {
+                    employeeId: employee_id,
+                    email,
+                    passwordHash: password_hash,
+                    firstName: first_name,
+                    lastName: last_name,
+                    phone,
+                    role: role || 'EMPLOYEE',
+                    departmentId: finalDepartmentId || null,
+                    shiftId: shift_id || null,
+                    managerId: manager_id || (req.user.role === 'MANAGER' ? req.user.id : null),
+                    dateOfJoining: finalDateOfJoining,
+                    dateOfBirth: date_of_birth ? new Date(date_of_birth) : null,
+                    address,
+                    emergencyContact: emergency_contact,
+                    createdBy: req.user.id
+                },
+                select: {
+                    id: true,
+                    employeeId: true,
+                    email: true,
+                    firstName: true,
+                    lastName: true,
+                    role: true,
+                    status: true
+                }
+            });
 
             // Create leave balance for current year
-            await client.query(
-                `INSERT INTO leave_balances (user_id, year) VALUES ($1, EXTRACT(YEAR FROM CURRENT_DATE))`,
-                [newUser.id]
-            );
+            await tx.leaveBalance.create({
+                data: {
+                    userId: newUser.id,
+                    year: new Date().getFullYear()
+                }
+            });
 
             return newUser;
         });
 
-        await createAuditLog(req.user.id, 'CREATE', 'users', result.id, null, 
+        await createAuditLog(req.user.id, 'CREATE', 'users', result.id, null,
             { employee_id, email, role: role || 'EMPLOYEE' }, 'New user created', req.ip);
 
         res.status(201).json({
             success: true,
             message: 'User created successfully',
-            data: result
+            data: {
+                id: result.id,
+                employee_id: result.employeeId,
+                email: result.email,
+                first_name: result.firstName,
+                last_name: result.lastName,
+                role: result.role,
+                status: result.status
+            }
         });
     } catch (error) {
         next(error);
@@ -346,15 +373,13 @@ router.put('/:id', authenticate, canManageUsers, userValidation.update, async (r
         const updates = req.body;
 
         // Get current user data for audit
-        const currentResult = await query('SELECT * FROM users WHERE id = $1', [id]);
-        if (currentResult.rows.length === 0) {
+        const currentUser = await prisma.user.findUnique({ where: { id } });
+        if (!currentUser) {
             return res.status(404).json({
                 success: false,
                 error: 'User not found'
             });
         }
-
-        const currentUser = currentResult.rows[0];
 
         // HR cannot change role to Admin
         if (req.user.role === 'HR' && updates.role === 'ADMIN') {
@@ -364,48 +389,57 @@ router.put('/:id', authenticate, canManageUsers, userValidation.update, async (r
             });
         }
 
-        // Build update query
-        const allowedFields = ['first_name', 'last_name', 'phone', 'role', 'status',
-                              'department_id', 'shift_id', 'manager_id', 'address',
-                              'emergency_contact', 'date_of_birth'];
-        
-        const updateFields = [];
-        const values = [];
-        let paramCount = 0;
+        // Build update data
+        const updateData = {};
+        if (updates.first_name !== undefined) updateData.firstName = updates.first_name;
+        if (updates.last_name !== undefined) updateData.lastName = updates.last_name;
+        if (updates.phone !== undefined) updateData.phone = updates.phone;
+        if (updates.role !== undefined) updateData.role = updates.role;
+        if (updates.status !== undefined) updateData.status = updates.status;
+        if (updates.department_id !== undefined) updateData.departmentId = updates.department_id;
+        if (updates.shift_id !== undefined) updateData.shiftId = updates.shift_id;
+        if (updates.manager_id !== undefined) updateData.managerId = updates.manager_id;
+        if (updates.address !== undefined) updateData.address = updates.address;
+        if (updates.emergency_contact !== undefined) updateData.emergencyContact = updates.emergency_contact;
+        if (updates.date_of_birth !== undefined) updateData.dateOfBirth = new Date(updates.date_of_birth);
 
-        for (const field of allowedFields) {
-            if (updates[field] !== undefined) {
-                paramCount++;
-                updateFields.push(`${field} = $${paramCount}`);
-                values.push(updates[field]);
-            }
-        }
-
-        if (updateFields.length === 0) {
+        if (Object.keys(updateData).length === 0) {
             return res.status(400).json({
                 success: false,
                 error: 'No valid fields to update'
             });
         }
 
-        paramCount++;
-        values.push(id);
+        const user = await prisma.user.update({
+            where: { id },
+            data: updateData,
+            select: {
+                id: true,
+                employeeId: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                role: true,
+                status: true
+            }
+        });
 
-        const result = await query(
-            `UPDATE users SET ${updateFields.join(', ')}, updated_at = NOW()
-             WHERE id = $${paramCount}
-             RETURNING id, employee_id, email, first_name, last_name, role, status`,
-            values
-        );
-
-        await createAuditLog(req.user.id, 'UPDATE', 'users', id, 
-            { first_name: currentUser.first_name, last_name: currentUser.last_name, role: currentUser.role, status: currentUser.status },
+        await createAuditLog(req.user.id, 'UPDATE', 'users', id,
+            { first_name: currentUser.firstName, last_name: currentUser.lastName, role: currentUser.role, status: currentUser.status },
             updates, 'User updated', req.ip);
 
         res.json({
             success: true,
             message: 'User updated successfully',
-            data: result.rows[0]
+            data: {
+                id: user.id,
+                employee_id: user.employeeId,
+                email: user.email,
+                first_name: user.firstName,
+                last_name: user.lastName,
+                role: user.role,
+                status: user.status
+            }
         });
     } catch (error) {
         next(error);
@@ -426,12 +460,10 @@ router.patch('/:id/deactivate', authenticate, canManageUsers, async (req, res, n
         }
 
         // Get target user to check permissions
-        const targetUser = await query('SELECT * FROM users WHERE id = $1', [id]);
-        if (targetUser.rows.length === 0) {
+        const target = await prisma.user.findUnique({ where: { id } });
+        if (!target) {
             return res.status(404).json({ success: false, error: 'User not found' });
         }
-
-        const target = targetUser.rows[0];
 
         // Cannot deactivate GM
         if (target.role === 'GM') {
@@ -440,24 +472,34 @@ router.patch('/:id/deactivate', authenticate, canManageUsers, async (req, res, n
 
         // Manager can only deactivate employees in their department
         if (req.user.role === 'MANAGER') {
-            if (target.role !== 'EMPLOYEE' || target.department_id !== req.user.department_id) {
+            if (target.role !== 'EMPLOYEE' || target.departmentId !== req.user.department_id) {
                 return res.status(403).json({ success: false, error: 'You can only deactivate employees in your department' });
             }
         }
 
-        const result = await query(
-            `UPDATE users SET status = 'INACTIVE', updated_at = NOW() WHERE id = $1
-             RETURNING id, employee_id, email, status`,
-            [id]
-        );
+        const user = await prisma.user.update({
+            where: { id },
+            data: { status: 'INACTIVE' },
+            select: {
+                id: true,
+                employeeId: true,
+                email: true,
+                status: true
+            }
+        });
 
-        await createAuditLog(req.user.id, 'UPDATE', 'users', id, 
+        await createAuditLog(req.user.id, 'UPDATE', 'users', id,
             { status: 'ACTIVE' }, { status: 'INACTIVE' }, reason, req.ip);
 
         res.json({
             success: true,
             message: 'User deactivated successfully',
-            data: result.rows[0]
+            data: {
+                id: user.id,
+                employee_id: user.employeeId,
+                email: user.email,
+                status: user.status
+            }
         });
     } catch (error) {
         next(error);
@@ -467,31 +509,35 @@ router.patch('/:id/deactivate', authenticate, canManageUsers, async (req, res, n
 // Get team members (for Managers)
 router.get('/team/members', authenticate, authorize('MANAGER', 'ADMIN', 'HR'), async (req, res, next) => {
     try {
-        let queryText = `
-            SELECT u.id, u.employee_id, u.email, u.first_name, u.last_name,
-                   u.role, u.status, u.profile_picture_url,
-                   d.name as department_name, s.name as shift_name
-            FROM users u
-            LEFT JOIN departments d ON u.department_id = d.id
-            LEFT JOIN shifts s ON u.shift_id = s.id
-            WHERE u.status = 'ACTIVE'
-        `;
-        const params = [];
+        let whereClause = { status: 'ACTIVE' };
 
         if (req.user.role === 'MANAGER') {
-            queryText += ` AND u.manager_id = $1`;
-            params.push(req.user.id);
+            whereClause.managerId = req.user.id;
         }
 
-        queryText += ` ORDER BY u.first_name, u.last_name`;
-
-        const result = await query(queryText, params);
+        const users = await prisma.user.findMany({
+            where: whereClause,
+            include: {
+                department: { select: { name: true } },
+                shift: { select: { name: true } }
+            },
+            orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }]
+        });
 
         res.json({
             success: true,
-            data: result.rows.map(user => ({
-                ...user,
-                full_name: `${user.first_name} ${user.last_name}`
+            data: users.map(user => ({
+                id: user.id,
+                employee_id: user.employeeId,
+                email: user.email,
+                first_name: user.firstName,
+                last_name: user.lastName,
+                role: user.role,
+                status: user.status,
+                profile_picture_url: user.profilePictureUrl,
+                department_name: user.department?.name,
+                shift_name: user.shift?.name,
+                full_name: `${user.firstName} ${user.lastName}`
             }))
         });
     } catch (error) {
@@ -510,12 +556,10 @@ router.delete('/:id', authenticate, canManageUsers, async (req, res, next) => {
         }
 
         // Get target user to check permissions
-        const targetUser = await query('SELECT * FROM users WHERE id = $1', [id]);
-        if (targetUser.rows.length === 0) {
+        const target = await prisma.user.findUnique({ where: { id } });
+        if (!target) {
             return res.status(404).json({ success: false, error: 'User not found' });
         }
-
-        const target = targetUser.rows[0];
 
         // Nobody can delete GM (Director)
         if (target.role === 'GM') {
@@ -527,7 +571,7 @@ router.delete('/:id', authenticate, canManageUsers, async (req, res, next) => {
             if (target.role !== 'EMPLOYEE') {
                 return res.status(403).json({ success: false, error: 'Managers can only delete employees' });
             }
-            if (target.department_id !== req.user.department_id) {
+            if (target.departmentId !== req.user.department_id) {
                 return res.status(403).json({ success: false, error: 'You can only delete employees in your department' });
             }
         }
@@ -538,10 +582,10 @@ router.delete('/:id', authenticate, canManageUsers, async (req, res, next) => {
         }
 
         // Delete user
-        await query('DELETE FROM users WHERE id = $1', [id]);
+        await prisma.user.delete({ where: { id } });
 
-        await createAuditLog(req.user.id, 'DELETE', 'users', id, 
-            { employee_id: target.employee_id, email: target.email, role: target.role }, 
+        await createAuditLog(req.user.id, 'DELETE', 'users', id,
+            { employee_id: target.employeeId, email: target.email, role: target.role },
             null, 'User deleted', req.ip);
 
         res.json({
@@ -568,26 +612,37 @@ router.post('/:id/reset-password', authenticate, isAdmin, async (req, res, next)
 
         const password_hash = await bcrypt.hash(new_password, 12);
 
-        const result = await query(
-            `UPDATE users SET password_hash = $1, password_changed_at = NOW() WHERE id = $2
-             RETURNING id, employee_id, email`,
-            [password_hash, id]
-        );
+        const user = await prisma.user.update({
+            where: { id },
+            data: {
+                passwordHash: password_hash,
+                passwordChangedAt: new Date()
+            },
+            select: {
+                id: true,
+                employeeId: true,
+                email: true
+            }
+        }).catch(() => null);
 
-        if (result.rows.length === 0) {
+        if (!user) {
             return res.status(404).json({
                 success: false,
                 error: 'User not found'
             });
         }
 
-        await createAuditLog(req.user.id, 'UPDATE', 'users', id, null, 
+        await createAuditLog(req.user.id, 'UPDATE', 'users', id, null,
             { action: 'password_reset' }, 'Admin password reset', req.ip);
 
         res.json({
             success: true,
             message: 'Password reset successfully',
-            data: result.rows[0]
+            data: {
+                id: user.id,
+                employee_id: user.employeeId,
+                email: user.email
+            }
         });
     } catch (error) {
         next(error);
@@ -598,52 +653,85 @@ router.post('/:id/reset-password', authenticate, isAdmin, async (req, res, next)
 router.get('/organization/hierarchy', authenticate, async (req, res, next) => {
     try {
         // Get GM (Director)
-        const gmResult = await query(
-            `SELECT u.id, u.employee_id, u.email, u.first_name, u.last_name, u.phone,
-                    u.role, u.profile_picture_url, d.name as department_name
-             FROM users u
-             LEFT JOIN departments d ON u.department_id = d.id
-             WHERE u.role = 'GM' AND u.status = 'ACTIVE'
-             LIMIT 1`
-        );
+        const gm = await prisma.user.findFirst({
+            where: { role: 'GM', status: 'ACTIVE' },
+            include: {
+                department: { select: { name: true } }
+            }
+        });
 
         // Get all department managers with their department info
-        const managersResult = await query(
-            `SELECT u.id, u.employee_id, u.email, u.first_name, u.last_name, u.phone,
-                    u.role, u.profile_picture_url, u.department_id,
-                    d.name as department_name, d.code as department_code,
-                    (SELECT COUNT(*) FROM users WHERE department_id = u.department_id AND status = 'ACTIVE') as employee_count
-             FROM users u
-             LEFT JOIN departments d ON u.department_id = d.id
-             WHERE u.role = 'MANAGER' AND u.status = 'ACTIVE'
-             ORDER BY d.name`
-        );
+        const managers = await prisma.user.findMany({
+            where: { role: 'MANAGER', status: 'ACTIVE' },
+            include: {
+                department: { select: { id: true, name: true, code: true } }
+            },
+            orderBy: { department: { name: 'asc' } }
+        });
 
-        // Get department heads (from departments table)
-        const deptHeadsResult = await query(
-            `SELECT d.id as department_id, d.name as department_name, d.code as department_code,
-                    u.id as head_id, u.first_name, u.last_name, u.email, u.role
-             FROM departments d
-             LEFT JOIN users u ON d.head_id = u.id
-             WHERE d.is_active = true
-             ORDER BY d.name`
-        );
+        // Get employee counts per department
+        const employeeCounts = await prisma.user.groupBy({
+            by: ['departmentId'],
+            where: { status: 'ACTIVE' },
+            _count: { id: true }
+        });
+        const countMap = {};
+        employeeCounts.forEach(c => {
+            if (c.departmentId) countMap[c.departmentId] = c._count.id;
+        });
+
+        // Get department heads
+        const departments = await prisma.department.findMany({
+            where: { isActive: true },
+            include: {
+                head: {
+                    select: { id: true, firstName: true, lastName: true, email: true, role: true }
+                }
+            },
+            orderBy: { name: 'asc' }
+        });
 
         res.json({
             success: true,
             data: {
-                director: gmResult.rows[0] ? {
-                    ...gmResult.rows[0],
-                    full_name: `${gmResult.rows[0].first_name} ${gmResult.rows[0].last_name}`,
+                director: gm ? {
+                    id: gm.id,
+                    employee_id: gm.employeeId,
+                    email: gm.email,
+                    first_name: gm.firstName,
+                    last_name: gm.lastName,
+                    phone: gm.phone,
+                    role: gm.role,
+                    profile_picture_url: gm.profilePictureUrl,
+                    department_name: gm.department?.name,
+                    full_name: `${gm.firstName} ${gm.lastName}`,
                     title: 'Director / General Manager'
                 } : null,
-                department_managers: managersResult.rows.map(mgr => ({
-                    ...mgr,
-                    full_name: `${mgr.first_name} ${mgr.last_name}`
+                department_managers: managers.map(mgr => ({
+                    id: mgr.id,
+                    employee_id: mgr.employeeId,
+                    email: mgr.email,
+                    first_name: mgr.firstName,
+                    last_name: mgr.lastName,
+                    phone: mgr.phone,
+                    role: mgr.role,
+                    profile_picture_url: mgr.profilePictureUrl,
+                    department_id: mgr.departmentId,
+                    department_name: mgr.department?.name,
+                    department_code: mgr.department?.code,
+                    employee_count: countMap[mgr.departmentId] || 0,
+                    full_name: `${mgr.firstName} ${mgr.lastName}`
                 })),
-                departments: deptHeadsResult.rows.map(dept => ({
-                    ...dept,
-                    head_name: dept.first_name ? `${dept.first_name} ${dept.last_name}` : null
+                departments: departments.map(dept => ({
+                    department_id: dept.id,
+                    department_name: dept.name,
+                    department_code: dept.code,
+                    head_id: dept.headId,
+                    first_name: dept.head?.firstName,
+                    last_name: dept.head?.lastName,
+                    email: dept.head?.email,
+                    role: dept.head?.role,
+                    head_name: dept.head ? `${dept.head.firstName} ${dept.head.lastName}` : null
                 }))
             }
         });
@@ -665,24 +753,31 @@ router.get('/department/:departmentId/employees', authenticate, isManagerOrAbove
             });
         }
 
-        const result = await query(
-            `SELECT u.id, u.employee_id, u.email, u.first_name, u.last_name, u.phone,
-                    u.role, u.status, u.date_of_joining, u.profile_picture_url,
-                    s.name as shift_name,
-                    m.first_name || ' ' || m.last_name as manager_name
-             FROM users u
-             LEFT JOIN shifts s ON u.shift_id = s.id
-             LEFT JOIN users m ON u.manager_id = m.id
-             WHERE u.department_id = $1 AND u.status = 'ACTIVE'
-             ORDER BY u.first_name, u.last_name`,
-            [departmentId]
-        );
+        const users = await prisma.user.findMany({
+            where: { departmentId, status: 'ACTIVE' },
+            include: {
+                shift: { select: { name: true } },
+                manager: { select: { firstName: true, lastName: true } }
+            },
+            orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }]
+        });
 
         res.json({
             success: true,
-            data: result.rows.map(user => ({
-                ...user,
-                full_name: `${user.first_name} ${user.last_name}`
+            data: users.map(user => ({
+                id: user.id,
+                employee_id: user.employeeId,
+                email: user.email,
+                first_name: user.firstName,
+                last_name: user.lastName,
+                phone: user.phone,
+                role: user.role,
+                status: user.status,
+                date_of_joining: user.dateOfJoining,
+                profile_picture_url: user.profilePictureUrl,
+                shift_name: user.shift?.name,
+                manager_name: user.manager ? `${user.manager.firstName} ${user.manager.lastName}` : null,
+                full_name: `${user.firstName} ${user.lastName}`
             }))
         });
     } catch (error) {

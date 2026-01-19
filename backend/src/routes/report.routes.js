@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
-const { query } = require('../config/database');
+const prisma = require('../config/prisma');
 const { authenticate, authorize, isHROrAdmin } = require('../middleware/auth');
 
 // Middleware to allow ADMIN, HR, GM, or MANAGER for reports
@@ -20,68 +20,82 @@ router.get('/attendance', authenticate, canAccessReports, async (req, res, next)
             });
         }
 
-        let queryText = `
-            SELECT ar.date, ar.check_in_time, ar.check_out_time, ar.status, 
-                   ar.total_hours, ar.overtime_hours, ar.is_manual_entry,
-                   u.employee_id, u.first_name, u.last_name, u.email,
-                   d.name as department_name, s.name as shift_name
-            FROM attendance_records ar
-            JOIN users u ON ar.user_id = u.id
-            LEFT JOIN departments d ON u.department_id = d.id
-            LEFT JOIN shifts s ON ar.shift_id = s.id
-            WHERE ar.date >= $1 AND ar.date <= $2
-        `;
-        const params = [start_date, end_date];
-        let paramCount = 2;
+        let whereClause = {
+            date: {
+                gte: new Date(start_date),
+                lte: new Date(end_date)
+            }
+        };
 
         // Manager can only see their department's reports
         if (req.user.role === 'MANAGER') {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(req.user.department_id);
+            whereClause.user = { departmentId: req.user.department_id };
         } else if (department_id) {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(department_id);
+            whereClause.user = { departmentId: department_id };
         }
 
         if (user_id) {
-            paramCount++;
-            queryText += ` AND ar.user_id = $${paramCount}`;
-            params.push(user_id);
+            whereClause.userId = user_id;
         }
 
-        queryText += ` ORDER BY ar.date, u.first_name`;
-
-        const result = await query(queryText, params);
+        const records = await prisma.attendanceRecord.findMany({
+            where: whereClause,
+            include: {
+                user: {
+                    select: {
+                        employeeId: true,
+                        firstName: true,
+                        lastName: true,
+                        email: true,
+                        department: { select: { name: true } }
+                    }
+                },
+                shift: { select: { name: true } }
+            },
+            orderBy: [{ date: 'asc' }, { user: { firstName: 'asc' } }]
+        });
 
         // Generate summary
         const summary = {
-            total_records: result.rows.length,
-            present: result.rows.filter(r => r.status === 'PRESENT').length,
-            absent: result.rows.filter(r => r.status === 'ABSENT').length,
-            late: result.rows.filter(r => r.status === 'LATE').length,
-            half_day: result.rows.filter(r => r.status === 'HALF_DAY').length,
-            on_leave: result.rows.filter(r => r.status === 'ON_LEAVE').length,
-            total_hours: result.rows.reduce((sum, r) => sum + (parseFloat(r.total_hours) || 0), 0),
-            overtime_hours: result.rows.reduce((sum, r) => sum + (parseFloat(r.overtime_hours) || 0), 0)
+            total_records: records.length,
+            present: records.filter(r => r.status === 'PRESENT').length,
+            absent: records.filter(r => r.status === 'ABSENT').length,
+            late: records.filter(r => r.status === 'LATE').length,
+            half_day: records.filter(r => r.status === 'HALF_DAY').length,
+            on_leave: records.filter(r => r.status === 'ON_LEAVE').length,
+            total_hours: records.reduce((sum, r) => sum + (parseFloat(r.totalHours) || 0), 0),
+            overtime_hours: records.reduce((sum, r) => sum + (parseFloat(r.overtimeHours) || 0), 0)
         };
 
+        const data = records.map(r => ({
+            date: r.date,
+            check_in_time: r.checkInTime,
+            check_out_time: r.checkOutTime,
+            status: r.status,
+            total_hours: r.totalHours,
+            overtime_hours: r.overtimeHours,
+            is_manual_entry: r.isManualEntry,
+            employee_id: r.user.employeeId,
+            first_name: r.user.firstName,
+            last_name: r.user.lastName,
+            email: r.user.email,
+            department_name: r.user.department?.name,
+            shift_name: r.shift?.name,
+            employee_name: `${r.user.firstName} ${r.user.lastName}`
+        }));
+
         if (format === 'excel') {
-            return generateExcelReport(res, result.rows, 'Attendance Report', start_date, end_date);
+            return generateExcelReport(res, data, 'Attendance Report', start_date, end_date);
         }
 
         if (format === 'pdf') {
-            return generatePDFReport(res, result.rows, 'Attendance Report', start_date, end_date);
+            return generatePDFReport(res, data, 'Attendance Report', start_date, end_date);
         }
 
         res.json({
             success: true,
             data: {
-                records: result.rows.map(r => ({
-                    ...r,
-                    employee_name: `${r.first_name} ${r.last_name}`
-                })),
+                records: data,
                 summary,
                 period: { start_date, end_date }
             }
@@ -96,79 +110,74 @@ router.get('/leaves', authenticate, canAccessReports, async (req, res, next) => 
     try {
         const { start_date, end_date, department_id, leave_type, status, format } = req.query;
 
-        let queryText = `
-            SELECT lr.*, 
-                   u.employee_id, u.first_name, u.last_name, u.email,
-                   d.name as department_name,
-                   approver.first_name || ' ' || approver.last_name as approved_by_name
-            FROM leave_requests lr
-            JOIN users u ON lr.user_id = u.id
-            LEFT JOIN departments d ON u.department_id = d.id
-            LEFT JOIN users approver ON lr.approved_by = approver.id
-            WHERE 1=1
-        `;
-        const params = [];
-        let paramCount = 0;
+        let whereClause = {};
 
         // Manager can only see their department's leave reports
         if (req.user.role === 'MANAGER') {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(req.user.department_id);
+            whereClause.user = { departmentId: req.user.department_id };
         } else if (department_id) {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(department_id);
+            whereClause.user = { departmentId: department_id };
         }
 
-        if (start_date) {
-            paramCount++;
-            queryText += ` AND lr.start_date >= $${paramCount}`;
-            params.push(start_date);
-        }
+        if (start_date) whereClause.startDate = { gte: new Date(start_date) };
+        if (end_date) whereClause.endDate = { lte: new Date(end_date) };
+        if (leave_type) whereClause.leaveType = leave_type;
+        if (status) whereClause.status = status;
 
-        if (end_date) {
-            paramCount++;
-            queryText += ` AND lr.end_date <= $${paramCount}`;
-            params.push(end_date);
-        }
-
-        if (leave_type) {
-            paramCount++;
-            queryText += ` AND lr.leave_type = $${paramCount}`;
-            params.push(leave_type);
-        }
-
-        if (status) {
-            paramCount++;
-            queryText += ` AND lr.status = $${paramCount}`;
-            params.push(status);
-        }
-
-        queryText += ` ORDER BY lr.created_at DESC`;
-
-        const result = await query(queryText, params);
+        const records = await prisma.leaveRequest.findMany({
+            where: whereClause,
+            include: {
+                user: {
+                    select: {
+                        employeeId: true,
+                        firstName: true,
+                        lastName: true,
+                        email: true,
+                        department: { select: { name: true } }
+                    }
+                },
+                approvedBy: {
+                    select: { firstName: true, lastName: true }
+                }
+            },
+            orderBy: { createdAt: 'desc' }
+        });
 
         // Generate summary
         const summary = {
-            total_requests: result.rows.length,
-            pending: result.rows.filter(r => r.status === 'PENDING').length,
-            approved: result.rows.filter(r => r.status === 'APPROVED').length,
-            rejected: result.rows.filter(r => r.status === 'REJECTED').length,
-            total_days: result.rows.reduce((sum, r) => sum + r.total_days, 0)
+            total_requests: records.length,
+            pending: records.filter(r => r.status === 'PENDING').length,
+            approved: records.filter(r => r.status === 'APPROVED').length,
+            rejected: records.filter(r => r.status === 'REJECTED').length,
+            total_days: records.reduce((sum, r) => sum + r.totalDays, 0)
         };
 
+        const data = records.map(r => ({
+            id: r.id,
+            leave_type: r.leaveType,
+            start_date: r.startDate,
+            end_date: r.endDate,
+            total_days: r.totalDays,
+            reason: r.reason,
+            status: r.status,
+            created_at: r.createdAt,
+            employee_id: r.user.employeeId,
+            first_name: r.user.firstName,
+            last_name: r.user.lastName,
+            email: r.user.email,
+            department_name: r.user.department?.name,
+            approved_by_name: r.approvedBy ? `${r.approvedBy.firstName} ${r.approvedBy.lastName}` : null,
+            employee_name: `${r.user.firstName} ${r.user.lastName}`
+        }));
+
         if (format === 'excel') {
-            return generateLeaveExcelReport(res, result.rows, start_date, end_date);
+            return generateLeaveExcelReport(res, data, start_date, end_date);
         }
 
         res.json({
             success: true,
             data: {
-                records: result.rows.map(r => ({
-                    ...r,
-                    employee_name: `${r.first_name} ${r.last_name}`
-                })),
+                records: data,
                 summary
             }
         });
@@ -181,66 +190,71 @@ router.get('/leaves', authenticate, canAccessReports, async (req, res, next) => 
 router.get('/employee-summary', authenticate, canAccessReports, async (req, res, next) => {
     try {
         const { month, year, department_id } = req.query;
-        const targetMonth = month || new Date().getMonth() + 1;
-        const targetYear = year || new Date().getFullYear();
+        const targetMonth = parseInt(month) || new Date().getMonth() + 1;
+        const targetYear = parseInt(year) || new Date().getFullYear();
 
-        let queryText = `
-            SELECT 
-                u.id, u.employee_id, u.first_name, u.last_name, u.email,
-                d.name as department_name, s.name as shift_name,
-                COUNT(CASE WHEN ar.status = 'PRESENT' THEN 1 END) as present_days,
-                COUNT(CASE WHEN ar.status = 'ABSENT' THEN 1 END) as absent_days,
-                COUNT(CASE WHEN ar.status = 'LATE' THEN 1 END) as late_days,
-                COUNT(CASE WHEN ar.status = 'HALF_DAY' THEN 1 END) as half_days,
-                COUNT(CASE WHEN ar.status = 'ON_LEAVE' THEN 1 END) as leave_days,
-                COALESCE(SUM(ar.total_hours), 0) as total_hours,
-                COALESCE(SUM(ar.overtime_hours), 0) as overtime_hours
-            FROM users u
-            LEFT JOIN departments d ON u.department_id = d.id
-            LEFT JOIN shifts s ON u.shift_id = s.id
-            LEFT JOIN attendance_records ar ON u.id = ar.user_id 
-                AND EXTRACT(MONTH FROM ar.date) = $1
-                AND EXTRACT(YEAR FROM ar.date) = $2
-            WHERE u.status = 'ACTIVE'
-        `;
-        const params = [targetMonth, targetYear];
-        let paramCount = 2;
+        // Calculate date range for the month
+        const startDate = new Date(targetYear, targetMonth - 1, 1);
+        const endDate = new Date(targetYear, targetMonth, 0);
+
+        let userWhereClause = { status: 'ACTIVE' };
 
         // Manager can only see their department's employee summary
         if (req.user.role === 'MANAGER') {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(req.user.department_id);
+            userWhereClause.departmentId = req.user.department_id;
         } else if (department_id) {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(department_id);
+            userWhereClause.departmentId = department_id;
         }
 
-        queryText += ` GROUP BY u.id, u.employee_id, u.first_name, u.last_name, u.email, d.name, s.name
-                       ORDER BY u.first_name`;
+        const users = await prisma.user.findMany({
+            where: userWhereClause,
+            include: {
+                department: { select: { name: true } },
+                shift: { select: { name: true } },
+                attendanceRecords: {
+                    where: {
+                        date: { gte: startDate, lte: endDate }
+                    }
+                },
+                leaveBalances: {
+                    where: { year: targetYear }
+                }
+            },
+            orderBy: { firstName: 'asc' }
+        });
 
-        const result = await query(queryText, params);
+        const data = users.map(u => {
+            const records = u.attendanceRecords;
+            const balance = u.leaveBalances[0];
 
-        // Get leave balances
-        const leaveResult = await query(
-            `SELECT user_id, casual_used, sick_used, paid_used, unpaid_used
-             FROM leave_balances WHERE year = $1`,
-            [targetYear]
-        );
-
-        const leaveMap = {};
-        leaveResult.rows.forEach(lb => {
-            leaveMap[lb.user_id] = lb;
+            return {
+                id: u.id,
+                employee_id: u.employeeId,
+                first_name: u.firstName,
+                last_name: u.lastName,
+                email: u.email,
+                department_name: u.department?.name,
+                shift_name: u.shift?.name,
+                present_days: records.filter(r => r.status === 'PRESENT').length,
+                absent_days: records.filter(r => r.status === 'ABSENT').length,
+                late_days: records.filter(r => r.status === 'LATE').length,
+                half_days: records.filter(r => r.status === 'HALF_DAY').length,
+                leave_days: records.filter(r => r.status === 'ON_LEAVE').length,
+                total_hours: records.reduce((sum, r) => sum + (parseFloat(r.totalHours) || 0), 0),
+                overtime_hours: records.reduce((sum, r) => sum + (parseFloat(r.overtimeHours) || 0), 0),
+                full_name: `${u.firstName} ${u.lastName}`,
+                leave_balance: balance ? {
+                    casual_used: balance.casualUsed,
+                    sick_used: balance.sickUsed,
+                    paid_used: balance.paidUsed,
+                    unpaid_used: balance.unpaidUsed
+                } : null
+            };
         });
 
         res.json({
             success: true,
-            data: result.rows.map(r => ({
-                ...r,
-                full_name: `${r.first_name} ${r.last_name}`,
-                leave_balance: leaveMap[r.id] || null
-            })),
+            data,
             period: { month: targetMonth, year: targetYear }
         });
     } catch (error) {
@@ -252,60 +266,71 @@ router.get('/employee-summary', authenticate, canAccessReports, async (req, res,
 router.get('/daily', authenticate, canAccessReports, async (req, res, next) => {
     try {
         const { date, department_id } = req.query;
-        const targetDate = date || new Date().toISOString().split('T')[0];
+        const targetDate = date ? new Date(date) : new Date();
+        targetDate.setHours(0, 0, 0, 0);
 
-        let queryText = `
-            SELECT 
-                u.id, u.employee_id, u.first_name, u.last_name, u.email,
-                d.name as department_name, s.name as shift_name,
-                s.start_time as shift_start, s.end_time as shift_end,
-                ar.check_in_time, ar.check_out_time, ar.status, ar.total_hours,
-                ar.is_face_verified, ar.is_manual_entry
-            FROM users u
-            LEFT JOIN departments d ON u.department_id = d.id
-            LEFT JOIN shifts s ON u.shift_id = s.id
-            LEFT JOIN attendance_records ar ON u.id = ar.user_id AND ar.date = $1
-            WHERE u.status = 'ACTIVE'
-        `;
-        const params = [targetDate];
-        let paramCount = 1;
+        let userWhereClause = { status: 'ACTIVE' };
 
         // Manager can only see their department's daily report
         if (req.user.role === 'MANAGER') {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(req.user.department_id);
+            userWhereClause.departmentId = req.user.department_id;
         } else if (department_id) {
-            paramCount++;
-            queryText += ` AND u.department_id = $${paramCount}`;
-            params.push(department_id);
+            userWhereClause.departmentId = department_id;
         }
 
-        queryText += ` ORDER BY d.name, u.first_name`;
+        const users = await prisma.user.findMany({
+            where: userWhereClause,
+            include: {
+                department: { select: { name: true } },
+                shift: {
+                    select: { name: true, startTime: true, endTime: true }
+                },
+                attendanceRecords: {
+                    where: { date: targetDate }
+                }
+            },
+            orderBy: [{ department: { name: 'asc' } }, { firstName: 'asc' }]
+        });
 
-        const result = await query(queryText, params);
+        const data = users.map(u => {
+            const record = u.attendanceRecords[0];
+            return {
+                id: u.id,
+                employee_id: u.employeeId,
+                first_name: u.firstName,
+                last_name: u.lastName,
+                email: u.email,
+                department_name: u.department?.name,
+                shift_name: u.shift?.name,
+                shift_start: u.shift?.startTime,
+                shift_end: u.shift?.endTime,
+                check_in_time: record?.checkInTime,
+                check_out_time: record?.checkOutTime,
+                status: record?.status || 'NOT_MARKED',
+                total_hours: record?.totalHours,
+                is_face_verified: record?.isFaceVerified,
+                is_manual_entry: record?.isManualEntry,
+                full_name: `${u.firstName} ${u.lastName}`
+            };
+        });
 
         // Calculate summary
         const summary = {
-            total_employees: result.rows.length,
-            present: result.rows.filter(r => r.status === 'PRESENT').length,
-            absent: result.rows.filter(r => !r.status || r.status === 'ABSENT').length,
-            late: result.rows.filter(r => r.status === 'LATE').length,
-            half_day: result.rows.filter(r => r.status === 'HALF_DAY').length,
-            on_leave: result.rows.filter(r => r.status === 'ON_LEAVE').length,
-            not_checked_in: result.rows.filter(r => !r.check_in_time).length
+            total_employees: data.length,
+            present: data.filter(r => r.status === 'PRESENT').length,
+            absent: data.filter(r => r.status === 'NOT_MARKED' || r.status === 'ABSENT').length,
+            late: data.filter(r => r.status === 'LATE').length,
+            half_day: data.filter(r => r.status === 'HALF_DAY').length,
+            on_leave: data.filter(r => r.status === 'ON_LEAVE').length,
+            not_checked_in: data.filter(r => !r.check_in_time).length
         };
 
         res.json({
             success: true,
             data: {
-                records: result.rows.map(r => ({
-                    ...r,
-                    full_name: `${r.first_name} ${r.last_name}`,
-                    status: r.status || 'NOT_MARKED'
-                })),
+                records: data,
                 summary,
-                date: targetDate
+                date: targetDate.toISOString().split('T')[0]
             }
         });
     } catch (error) {
@@ -422,10 +447,10 @@ async function generateLeaveExcelReport(res, data, startDate, endDate) {
 // Generate PDF report
 function generatePDFReport(res, data, title, startDate, endDate) {
     const doc = new PDFDocument({ margin: 30, size: 'A4', layout: 'landscape' });
-    
+
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename=attendance_report_${startDate}_${endDate}.pdf`);
-    
+
     doc.pipe(res);
 
     // Title
@@ -456,7 +481,7 @@ function generatePDFReport(res, data, title, startDate, endDate) {
         }
 
         const row = [
-            record.date,
+            record.date instanceof Date ? record.date.toISOString().split('T')[0] : record.date,
             `${record.first_name} ${record.last_name}`,
             record.department_name || '-',
             record.check_in_time ? new Date(record.check_in_time).toLocaleTimeString() : '-',

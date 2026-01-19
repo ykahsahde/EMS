@@ -5,8 +5,8 @@ import PublicFaceAttendance from '../components/PublicFaceAttendance'
 
 const Login = () => {
   const { login } = useAuth()
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
+  const [email, setEmail] = useState('admin@raymond.com')
+  const [password, setPassword] = useState('Admin@123')
   const [showPassword, setShowPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
@@ -18,31 +18,32 @@ const Login = () => {
     setIsLoading(true)
 
     const result = await login(email, password)
-    
+
     if (!result.success) {
       setError(result.error)
     }
-    
+
     setIsLoading(false)
   }
 
   // Show public attendance screen
   if (showPublicAttendance) {
     return (
-      <PublicFaceAttendance 
+      <PublicFaceAttendance
         onClose={() => setShowPublicAttendance(false)}
         onLoginClick={() => setShowPublicAttendance(false)}
       />
     )
   }
 
+
   return (
     <div className="min-h-screen flex">
       {/* Left Side - Full Image */}
       <div className="hidden md:flex md:w-1/2">
-        <img 
-          src="/Raymond_Home_page.jpg" 
-          alt="Raymond Lifestyle Ltd" 
+        <img
+          src="/Raymond_Home_page.jpg"
+          alt="Raymond Lifestyle Ltd"
           className="w-full h-full object-cover"
         />
       </div>

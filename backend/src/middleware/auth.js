@@ -84,7 +84,6 @@ const authorize = (...allowedRoles) => {
     };
 };
 
-// Check if user is Admin
 const isAdmin = authorize('ADMIN');
 
 // Check if user is HR or Admin

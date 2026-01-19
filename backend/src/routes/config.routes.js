@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { query } = require('../config/database');
+const prisma = require('../config/prisma');
 const { authenticate, isAdmin } = require('../middleware/auth');
 const { createAuditLog } = require('../middleware/logger');
 
@@ -16,11 +16,11 @@ const OFFICE_LOCATION_CONFIG = {
 // Helper function to get location verification setting from database
 async function getLocationVerificationSetting() {
     try {
-        const result = await query(
-            "SELECT config_value FROM attendance_config WHERE config_key = 'location_verification_required'"
-        );
-        if (result.rows.length > 0) {
-            return result.rows[0].config_value === 'true';
+        const config = await prisma.attendanceConfig.findUnique({
+            where: { configKey: 'location_verification_required' }
+        });
+        if (config) {
+            return config.configValue === 'true';
         }
         return true; // Default to true if not found
     } catch (error) {
@@ -32,27 +32,20 @@ async function getLocationVerificationSetting() {
 // Helper function to update location verification setting in database
 async function updateLocationVerificationSetting(enabled, userId) {
     try {
-        // Check if setting exists
-        const existsResult = await query(
-            "SELECT id FROM attendance_config WHERE config_key = 'location_verification_required'"
-        );
-        
-        if (existsResult.rows.length > 0) {
-            // Update existing
-            await query(
-                `UPDATE attendance_config 
-                 SET config_value = $1, updated_by = $2, updated_at = CURRENT_TIMESTAMP
-                 WHERE config_key = 'location_verification_required'`,
-                [enabled.toString(), userId]
-            );
-        } else {
-            // Insert new
-            await query(
-                `INSERT INTO attendance_config (config_key, config_value, description, data_type, updated_by)
-                 VALUES ('location_verification_required', $1, 'Require location verification for attendance', 'boolean', $2)`,
-                [enabled.toString(), userId]
-            );
-        }
+        await prisma.attendanceConfig.upsert({
+            where: { configKey: 'location_verification_required' },
+            update: {
+                configValue: enabled.toString(),
+                updatedById: userId
+            },
+            create: {
+                configKey: 'location_verification_required',
+                configValue: enabled.toString(),
+                description: 'Require location verification for attendance',
+                dataType: 'boolean',
+                updatedById: userId
+            }
+        });
         return true;
     } catch (error) {
         console.error('Error updating location verification setting:', error);
@@ -95,7 +88,7 @@ router.get('/location-verification-status', async (req, res, next) => {
 router.put('/location-verification', authenticate, isAdmin, async (req, res, next) => {
     try {
         const { enabled } = req.body;
-        
+
         if (typeof enabled !== 'boolean') {
             return res.status(400).json({
                 success: false,
@@ -104,7 +97,7 @@ router.put('/location-verification', authenticate, isAdmin, async (req, res, nex
         }
 
         const success = await updateLocationVerificationSetting(enabled, req.user.id);
-        
+
         if (!success) {
             return res.status(500).json({
                 success: false,
@@ -132,16 +125,31 @@ router.put('/location-verification', authenticate, isAdmin, async (req, res, nex
 // Get all configuration
 router.get('/', authenticate, async (req, res, next) => {
     try {
-        const result = await query(
-            `SELECT ac.*, u.first_name || ' ' || u.last_name as updated_by_name
-             FROM attendance_config ac
-             LEFT JOIN users u ON ac.updated_by = u.id
-             ORDER BY ac.config_key`
-        );
+        const configs = await prisma.attendanceConfig.findMany({
+            include: {
+                updatedBy: {
+                    select: {
+                        firstName: true,
+                        lastName: true
+                    }
+                }
+            },
+            orderBy: { configKey: 'asc' }
+        });
 
         res.json({
             success: true,
-            data: result.rows
+            data: configs.map(c => ({
+                id: c.id,
+                config_key: c.configKey,
+                config_value: c.configValue,
+                description: c.description,
+                data_type: c.dataType,
+                updated_by: c.updatedById,
+                created_at: c.createdAt,
+                updated_at: c.updatedAt,
+                updated_by_name: c.updatedBy ? `${c.updatedBy.firstName} ${c.updatedBy.lastName}` : null
+            }))
         });
     } catch (error) {
         next(error);
@@ -153,12 +161,11 @@ router.get('/:key', authenticate, async (req, res, next) => {
     try {
         const { key } = req.params;
 
-        const result = await query(
-            'SELECT * FROM attendance_config WHERE config_key = $1',
-            [key]
-        );
+        const config = await prisma.attendanceConfig.findUnique({
+            where: { configKey: key }
+        });
 
-        if (result.rows.length === 0) {
+        if (!config) {
             return res.status(404).json({
                 success: false,
                 error: 'Configuration not found'
@@ -167,7 +174,16 @@ router.get('/:key', authenticate, async (req, res, next) => {
 
         res.json({
             success: true,
-            data: result.rows[0]
+            data: {
+                id: config.id,
+                config_key: config.configKey,
+                config_value: config.configValue,
+                description: config.description,
+                data_type: config.dataType,
+                updated_by: config.updatedById,
+                created_at: config.createdAt,
+                updated_at: config.updatedAt
+            }
         });
     } catch (error) {
         next(error);
@@ -188,37 +204,44 @@ router.put('/:key', authenticate, isAdmin, async (req, res, next) => {
         }
 
         // Get current value for audit
-        const currentResult = await query(
-            'SELECT * FROM attendance_config WHERE config_key = $1',
-            [key]
-        );
+        const currentConfig = await prisma.attendanceConfig.findUnique({
+            where: { configKey: key }
+        });
 
-        if (currentResult.rows.length === 0) {
+        if (!currentConfig) {
             return res.status(404).json({
                 success: false,
                 error: 'Configuration not found'
             });
         }
 
-        const result = await query(
-            `UPDATE attendance_config 
-             SET config_value = $1, 
-                 description = COALESCE($2, description),
-                 updated_by = $3
-             WHERE config_key = $4
-             RETURNING *`,
-            [value.toString(), description, req.user.id, key]
-        );
+        const config = await prisma.attendanceConfig.update({
+            where: { configKey: key },
+            data: {
+                configValue: value.toString(),
+                description: description !== undefined ? description : undefined,
+                updatedById: req.user.id
+            }
+        });
 
-        await createAuditLog(req.user.id, 'UPDATE', 'attendance_config', result.rows[0].id,
-            { config_key: key, config_value: currentResult.rows[0].config_value },
+        await createAuditLog(req.user.id, 'UPDATE', 'attendance_config', config.id,
+            { config_key: key, config_value: currentConfig.configValue },
             { config_key: key, config_value: value },
             'Configuration updated', req.ip);
 
         res.json({
             success: true,
             message: 'Configuration updated successfully',
-            data: result.rows[0]
+            data: {
+                id: config.id,
+                config_key: config.configKey,
+                config_value: config.configValue,
+                description: config.description,
+                data_type: config.dataType,
+                updated_by: config.updatedById,
+                created_at: config.createdAt,
+                updated_at: config.updatedAt
+            }
         });
     } catch (error) {
         next(error);
@@ -237,20 +260,32 @@ router.post('/', authenticate, isAdmin, async (req, res, next) => {
             });
         }
 
-        const result = await query(
-            `INSERT INTO attendance_config (config_key, config_value, description, data_type, updated_by)
-             VALUES ($1, $2, $3, $4, $5)
-             RETURNING *`,
-            [config_key, config_value.toString(), description, data_type || 'string', req.user.id]
-        );
+        const config = await prisma.attendanceConfig.create({
+            data: {
+                configKey: config_key,
+                configValue: config_value.toString(),
+                description,
+                dataType: data_type || 'string',
+                updatedById: req.user.id
+            }
+        });
 
-        await createAuditLog(req.user.id, 'CREATE', 'attendance_config', result.rows[0].id,
+        await createAuditLog(req.user.id, 'CREATE', 'attendance_config', config.id,
             null, { config_key, config_value }, 'Configuration created', req.ip);
 
         res.status(201).json({
             success: true,
             message: 'Configuration created successfully',
-            data: result.rows[0]
+            data: {
+                id: config.id,
+                config_key: config.configKey,
+                config_value: config.configValue,
+                description: config.description,
+                data_type: config.dataType,
+                updated_by: config.updatedById,
+                created_at: config.createdAt,
+                updated_at: config.updatedAt
+            }
         });
     } catch (error) {
         next(error);
@@ -262,20 +297,19 @@ router.delete('/:key', authenticate, isAdmin, async (req, res, next) => {
     try {
         const { key } = req.params;
 
-        const result = await query(
-            'DELETE FROM attendance_config WHERE config_key = $1 RETURNING *',
-            [key]
-        );
+        const config = await prisma.attendanceConfig.delete({
+            where: { configKey: key }
+        }).catch(() => null);
 
-        if (result.rows.length === 0) {
+        if (!config) {
             return res.status(404).json({
                 success: false,
                 error: 'Configuration not found'
             });
         }
 
-        await createAuditLog(req.user.id, 'DELETE', 'attendance_config', result.rows[0].id,
-            result.rows[0], null, 'Configuration deleted', req.ip);
+        await createAuditLog(req.user.id, 'DELETE', 'attendance_config', config.id,
+            { config_key: config.configKey, config_value: config.configValue }, null, 'Configuration deleted', req.ip);
 
         res.json({
             success: true,
@@ -303,30 +337,19 @@ router.put('/', authenticate, isAdmin, async (req, res, next) => {
 
         for (const [key, value] of Object.entries(configData)) {
             try {
-                // Check if config exists
-                const existing = await query(
-                    'SELECT * FROM attendance_config WHERE config_key = $1',
-                    [key]
-                );
-
-                if (existing.rows.length > 0) {
-                    // Update existing
-                    await query(
-                        `UPDATE attendance_config 
-                         SET config_value = $1, updated_by = $2
-                         WHERE config_key = $3`,
-                        [value.toString(), req.user.id, key]
-                    );
-                    updates.push(key);
-                } else {
-                    // Create new
-                    await query(
-                        `INSERT INTO attendance_config (config_key, config_value, updated_by)
-                         VALUES ($1, $2, $3)`,
-                        [key, value.toString(), req.user.id]
-                    );
-                    updates.push(key);
-                }
+                await prisma.attendanceConfig.upsert({
+                    where: { configKey: key },
+                    update: {
+                        configValue: value.toString(),
+                        updatedById: req.user.id
+                    },
+                    create: {
+                        configKey: key,
+                        configValue: value.toString(),
+                        updatedById: req.user.id
+                    }
+                });
+                updates.push(key);
             } catch (err) {
                 errors.push({ key, error: err.message });
             }
@@ -349,71 +372,61 @@ router.put('/', authenticate, isAdmin, async (req, res, next) => {
 router.get('/audit/logs', authenticate, isAdmin, async (req, res, next) => {
     try {
         const { entity_type, user_id, action, start_date, end_date, page = 1, limit = 50 } = req.query;
-        const offset = (page - 1) * limit;
+        const skip = (parseInt(page) - 1) * parseInt(limit);
 
-        let queryText = `
-            SELECT al.*, 
-                   u.employee_id, u.first_name, u.last_name
-            FROM audit_logs al
-            LEFT JOIN users u ON al.user_id = u.id
-            WHERE 1=1
-        `;
-        const params = [];
-        let paramCount = 0;
+        const whereClause = {};
 
-        if (entity_type) {
-            paramCount++;
-            queryText += ` AND al.entity_type = $${paramCount}`;
-            params.push(entity_type);
+        if (entity_type) whereClause.entityType = entity_type;
+        if (user_id) whereClause.userId = user_id;
+        if (action) whereClause.action = action;
+        if (start_date || end_date) {
+            whereClause.createdAt = {};
+            if (start_date) whereClause.createdAt.gte = new Date(start_date);
+            if (end_date) whereClause.createdAt.lte = new Date(end_date);
         }
 
-        if (user_id) {
-            paramCount++;
-            queryText += ` AND al.user_id = $${paramCount}`;
-            params.push(user_id);
-        }
-
-        if (action) {
-            paramCount++;
-            queryText += ` AND al.action = $${paramCount}`;
-            params.push(action);
-        }
-
-        if (start_date) {
-            paramCount++;
-            queryText += ` AND al.created_at >= $${paramCount}`;
-            params.push(start_date);
-        }
-
-        if (end_date) {
-            paramCount++;
-            queryText += ` AND al.created_at <= $${paramCount}`;
-            params.push(end_date);
-        }
-
-        // Get count
-        const countResult = await query(
-            queryText.replace(/SELECT .* FROM/, 'SELECT COUNT(*) FROM'),
-            params
-        );
-        const totalCount = parseInt(countResult.rows[0].count);
-
-        queryText += ` ORDER BY al.created_at DESC LIMIT $${paramCount + 1} OFFSET $${paramCount + 2}`;
-        params.push(limit, offset);
-
-        const result = await query(queryText, params);
+        const [logs, totalCount] = await Promise.all([
+            prisma.auditLog.findMany({
+                where: whereClause,
+                include: {
+                    user: {
+                        select: {
+                            employeeId: true,
+                            firstName: true,
+                            lastName: true
+                        }
+                    }
+                },
+                orderBy: { createdAt: 'desc' },
+                skip,
+                take: parseInt(limit)
+            }),
+            prisma.auditLog.count({ where: whereClause })
+        ]);
 
         res.json({
             success: true,
-            data: result.rows.map(log => ({
-                ...log,
-                user_name: log.first_name ? `${log.first_name} ${log.last_name}` : 'System'
+            data: logs.map(log => ({
+                id: log.id,
+                user_id: log.userId,
+                action: log.action,
+                entity_type: log.entityType,
+                entity_id: log.entityId,
+                old_values: log.oldValues,
+                new_values: log.newValues,
+                reason: log.reason,
+                ip_address: log.ipAddress,
+                created_at: log.createdAt,
+                employee_id: log.user?.employeeId,
+                first_name: log.user?.firstName,
+                last_name: log.user?.lastName,
+                user_name: log.user ? `${log.user.firstName} ${log.user.lastName}` : 'System'
             })),
             pagination: {
                 page: parseInt(page),
                 limit: parseInt(limit),
                 total: totalCount,
-                pages: Math.ceil(totalCount / limit)
+                pages: Math.ceil(totalCount / parseInt(limit))
             }
         });
     } catch (error) {

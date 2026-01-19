@@ -4,163 +4,88 @@ A complete attendance management system with face recognition, leave management,
 
 ## Tech Stack
 
-- Frontend: React 18 + Vite + Tailwind CSS
-- Backend: Node.js + Express REST API
-- Database: PostgreSQL 15
-- Containerization: Docker + Docker Compose
-- Face Recognition: face-api.js (TensorFlow.js)
+- **Frontend:** React 18 + Vite + Tailwind CSS
+- **Backend:** Node.js + Express + Prisma ORM
+- **Database:** PostgreSQL 15
+- **Containerization:** Docker
+- **Face Recognition:** face-api.js
 
-## Project Structure
-
-```
-├── frontend/                 # React + Vite application
-│   ├── src/
-│   │   ├── components/       # Reusable UI components
-│   │   ├── pages/            # Page components
-│   │   ├── contexts/         # React contexts (Auth)
-│   │   └── services/         # API services
-│   └── Public/models/        # Face detection models
-├── backend/                  # Express REST API
-│   ├── src/
-│   │   ├── routes/           # API routes
-│   │   ├── middleware/       # Auth, validation, logging
-│   │   └── config/           # Database configuration
-├── database/                 # PostgreSQL schema & migrations
-│   └── init.sql              # Database initialization script
-└── docker-compose.yml        # Docker services configuration
-```
-
-## Getting Started
+## Quick Start
 
 ### Prerequisites
+- Node.js 18+
+- Docker Desktop
 
-- Node.js 18 or higher
-- Docker and Docker Compose
-- Git
-
-### Installation
-
-1. Clone the repository
-
+### 1. Start Database
 ```bash
-git clone <repository-url>
-cd attendance-management-system
+docker-compose up -d postgres
 ```
 
-2. Start all services with Docker
-
-```bash
-docker-compose up -d
-```
-
-3. Access the application
-
-- Frontend: http://localhost:5173
-- Backend API: http://localhost:3000
-- pgAdmin: http://localhost:5050
-
-### Manual Setup (without Docker)
-
-1. Install frontend dependencies
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-2. Install backend dependencies
-
+### 2. Start Backend
 ```bash
 cd backend
 npm install
 npm run dev
 ```
 
-3. Set up PostgreSQL database and run init.sql
+### 3. Start Frontend
+```bash
+cd frontend
+npm install
+npm run dev
+```
 
-## User Roles
+### Access
+| Service | URL |
+|---------|-----|
+| Frontend | http://localhost:5173 |
+| Backend API | http://localhost:3000/api |
+| Prisma Studio | `npx prisma studio` (http://localhost:5555) |
+| pgAdmin | http://localhost:5050 |
 
-| Role | Access Level | Description |
-|------|--------------|-------------|
-| Admin | Full system control | System administrator, manages all settings |
-| GM (Director) | Company-wide oversight | General Manager, oversees all departments |
-| HR | Employee management | Manages employee records and attendance |
-| Manager | Department-level control | Manages employees in their department only |
-| Employee | Self-service | Personal attendance and leave requests |
-
-### Role Permissions
-
-- Admin: Full access to all features, can create any user role
-- GM: Oversees all departments, approves leaves across departments, views company-wide reports
-- HR: Manages employee records, can create Managers and Employees
-- Manager: Manages own department employees, approves department leave requests
-- Employee: Mark attendance, apply for leave, view own records
-
-### Default Login Credentials
+## Default Login
 
 | Email | Password | Role |
 |-------|----------|------|
 | admin@raymond.com | Admin@123 | Admin |
+| gm@raymond.com | Gm@12345 | GM (Director) |
 | hr@raymond.com | Hr@12345 | HR |
 | manager@raymond.com | Manager@123 | Manager |
 | employee@raymond.com | Employee@123 | Employee |
-| gm@raymond.com | Gm@12345 | GM |
 
 ## Features
 
-- Role-based access control with 5 user levels
-- Face recognition for attendance marking
-- Location-based attendance verification
-- Multiple shift support (Day, Night, Morning, Evening, Flexible)
+- Face recognition attendance
+- Location-based verification
 - Leave management with approval workflow
-- Holiday calendar management
-- Department and employee management
-- Attendance reports with Excel/PDF export
-- Audit logging for all actions
-- Real-time dashboard with attendance statistics
+- Multiple shift support
+- Department & employee management
+- Excel/PDF reports
+- Role-based access control
+- Audit logging
 
-## API Endpoints
+## User Roles
 
-### Authentication
-- POST /api/auth/login - User login
-- POST /api/auth/logout - User logout
-- GET /api/auth/me - Get current user
+| Role | Description |
+|------|-------------|
+| Admin | Full system control |
+| GM | Company-wide oversight |
+| HR | Employee management |
+| Manager | Department-level control |
+| Employee | Self-service only |
 
-### Attendance
-- POST /api/attendance/check-in - Check in
-- POST /api/attendance/check-out - Check out
-- GET /api/attendance/today - Get today's attendance
-- GET /api/attendance/my - Get user's attendance history
+## Environment Variables
 
-### Users
-- GET /api/users - List all users
-- POST /api/users - Create new user
-- PUT /api/users/:id - Update user
-- DELETE /api/users/:id - Delete user
+Create `backend/.env`:
+```env
+DATABASE_URL="postgresql://raymond_admin:Raymond@2024Secure@localhost:5432/raymond_attendance"
+JWT_SECRET=your-secret-key
+JWT_EXPIRES_IN=8h
+PORT=3000
+NODE_ENV=development
+```
 
-### Leave
-- GET /api/leave - List leave requests
-- POST /api/leave - Apply for leave
-- PUT /api/leave/:id/approve - Approve leave
-- PUT /api/leave/:id/reject - Reject leave
-
-### Reports
-- GET /api/reports/attendance - Attendance report
-- GET /api/reports/summary - Summary report
-
-
-
-## Docker Services
-
-| Service | Port | Description |
-|---------|------|-------------|
-| postgres | 5432 | PostgreSQL database |
-| pgadmin | 5050 | Database management UI |
-| backend | 3000 | Node.js API server |
-| frontend | 5173 | React development server |
-
-### Docker Commands
+## Docker Commands
 
 ```bash
 # Start all services
@@ -169,28 +94,29 @@ docker-compose up -d
 # Stop all services
 docker-compose down
 
+# Access database CLI
+docker exec -it raymond_postgres psql -U raymond_admin -d raymond_attendance
+
 # View logs
 docker-compose logs -f backend
-
-# Rebuild containers
-docker-compose up -d --build
-
-# Access database
-docker exec -it raymond_postgres psql -U raymond_admin -d raymond_attendance
 ```
 
-## Database Tables
+## Database
 
-- users - Employee information and credentials
-- departments - Company departments
-- shifts - Work shift definitions
-- attendance_records - Daily attendance entries
-- leave_requests - Leave applications
-- leave_balances - Annual leave quotas
-- holidays - Company holidays
-- attendance_config - System configuration
-- audit_logs - Action history
+Managed by Prisma ORM. Key tables:
+- `users` - Employee accounts
+- `departments` - Company departments
+- `shifts` - Work shift definitions
+- `attendance_records` - Daily attendance
+- `leave_requests` - Leave applications
+- `leave_balances` - Annual leave quotas
+- `holidays` - Company holidays
+- `audit_logs` - Action history
 
-
-
-
+### Prisma Commands
+```bash
+cd backend
+npx prisma studio      # Open database GUI
+npx prisma migrate dev # Run migrations
+npx prisma generate    # Generate client
+```
