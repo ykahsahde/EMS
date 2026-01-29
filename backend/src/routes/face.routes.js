@@ -262,6 +262,7 @@ router.get('/status', authenticate, async (req, res, next) => {
         res.json({
             success: true,
             data: {
+                face_registered: !!user?.faceRegisteredAt,
                 is_registered: !!user?.faceRegisteredAt,
                 registered_at: user?.faceRegisteredAt
             }

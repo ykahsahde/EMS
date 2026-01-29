@@ -2,9 +2,9 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useAuth } from '../contexts/AuthContext'
 import { attendanceAPI, faceAPI } from '../services/api'
-import { 
-  Clock, LogIn, LogOut, Calendar, CheckCircle, XCircle, 
-  Timer, AlertCircle, ScanFace, MapPin, Camera, UserCheck
+import {
+  Clock, LogIn, LogOut, Calendar, CheckCircle, XCircle,
+  Timer, AlertCircle, ScanFace, Camera, UserCheck
 } from 'lucide-react'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
@@ -116,7 +116,7 @@ const Attendance = () => {
           <p className="text-gray-500">Track your daily attendance</p>
         </div>
         {(isAdmin || isHR) && (
-          <button 
+          <button
             onClick={() => setShowManualEntry(true)}
             className="btn-secondary"
           >
@@ -131,7 +131,7 @@ const Attendance = () => {
           <div>
             <h2 className="text-lg font-semibold text-gray-900">Today's Attendance</h2>
             <p className="text-gray-500">{format(new Date(), 'EEEE, MMMM d, yyyy')}</p>
-            
+
             {todayData?.shift && (
               <div className="mt-2 flex items-center gap-2 text-sm text-gray-600">
                 <Clock className="w-4 h-4" />
@@ -184,7 +184,7 @@ const Attendance = () => {
                 </span>
               </div>
             )}
-            
+
             <button
               onClick={handleCheckIn}
               disabled={!todayData?.can_check_in || checkInMutation.isPending}
@@ -294,13 +294,13 @@ const Attendance = () => {
                         {format(new Date(record.date), 'EEE, MMM d')}
                       </td>
                       <td className="table-cell">
-                        {record.check_in_time 
+                        {record.check_in_time
                           ? format(new Date(record.check_in_time), 'hh:mm a')
                           : '-'
                         }
                       </td>
                       <td className="table-cell">
-                        {record.check_out_time 
+                        {record.check_out_time
                           ? format(new Date(record.check_out_time), 'hh:mm a')
                           : '-'
                         }

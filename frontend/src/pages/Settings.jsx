@@ -1,10 +1,10 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useAuth } from '../contexts/AuthContext'
-import { configAPI, attendanceAPI } from '../services/api'
-import { 
-  Settings as SettingsIcon, Save, RefreshCw, Shield, Clock, 
-  Bell, Database, Lock, Globe, MapPin
+import { configAPI } from '../services/api'
+import {
+  Settings as SettingsIcon, Save, RefreshCw, Shield, Clock,
+  Bell, Database, Lock, Globe
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import clsx from 'clsx'
@@ -24,16 +24,6 @@ const Settings = () => {
     enabled: isAdmin || isHR
   })
 
-  // Fetch location verification status
-  const { data: locationVerificationData } = useQuery({
-    queryKey: ['location-verification-status'],
-    queryFn: async () => {
-      const response = await attendanceAPI.getLocationVerificationStatus()
-      return response.data.data
-    },
-    enabled: isAdmin
-  })
-
   // Form state
   const [formData, setFormData] = useState({
     company_name: 'Raymond Lifestyle Ltd.',
@@ -44,8 +34,6 @@ const Settings = () => {
     half_day_after_hours: 4,
     overtime_start_after_hours: 8,
     face_recognition_required: true,
-    location_tracking_enabled: true,
-    location_verification_required: true, // New setting for mandatory location check
     auto_checkout_enabled: false,
     auto_checkout_time: '23:00',
     leave_approval_required: true,
@@ -64,29 +52,7 @@ const Settings = () => {
     }
   })
 
-  // Update location verification mutation
-  const updateLocationVerificationMutation = useMutation({
-    mutationFn: (enabled) => attendanceAPI.updateLocationVerification(enabled),
-    onSuccess: (response) => {
-      const enabled = response.data.data.location_verification_required
-      toast.success(`Location verification ${enabled ? 'enabled' : 'disabled'} successfully!`)
-      queryClient.invalidateQueries(['location-verification-status'])
-      setFormData(prev => ({ ...prev, location_verification_required: enabled }))
-    },
-    onError: (error) => {
-      toast.error(error.response?.data?.error || 'Failed to update location verification setting')
-    }
-  })
 
-  // Update form data when location verification data is loaded
-  useEffect(() => {
-    if (locationVerificationData) {
-      setFormData(prev => ({
-        ...prev,
-        location_verification_required: locationVerificationData.location_verification_required
-      }))
-    }
-  }, [locationVerificationData])
 
   const handleSave = () => {
     updateConfigMutation.mutate(formData)
@@ -130,7 +96,7 @@ const Settings = () => {
           <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
           <p className="text-gray-500">Configure system settings and preferences</p>
         </div>
-        <button 
+        <button
           onClick={handleSave}
           disabled={updateConfigMutation.isPending}
           className="btn-primary flex items-center gap-2"
@@ -183,7 +149,7 @@ const Settings = () => {
                     <Globe className="w-5 h-5 text-gray-400" />
                     General Settings
                   </h2>
-                  
+
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">
                       Company Name
@@ -303,43 +269,6 @@ const Settings = () => {
                       </label>
                     </div>
 
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="font-medium text-gray-900">Location Tracking</p>
-                        <p className="text-sm text-gray-500">Track GPS location during check-in/out</p>
-                      </div>
-                      <label className="relative inline-flex items-center cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={formData.location_tracking_enabled}
-                          onChange={(e) => setFormData({ ...formData, location_tracking_enabled: e.target.checked })}
-                          className="sr-only peer"
-                        />
-                        <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-primary-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-primary-600"></div>
-                      </label>
-                    </div>
-
-                    <div className="flex items-center justify-between bg-blue-50 p-4 rounded-lg border border-blue-200">
-                      <div>
-                        <p className="font-medium text-blue-900">🛡️ Location Verification Required</p>
-                        <p className="text-sm text-blue-700">When enabled, employees must be at Raymond Borgaon Factory to mark attendance. When disabled, only face verification is required.</p>
-                        {!formData.location_verification_required && (
-                          <p className="text-xs text-orange-600 mt-1 font-medium">Warning: Currently disabled - Employees can mark attendance from anywhere</p>
-                        )}
-                      </div>
-                      <label className="relative inline-flex items-center cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={formData.location_verification_required}
-                          onChange={(e) => {
-                            updateLocationVerificationMutation.mutate(e.target.checked)
-                          }}
-                          disabled={updateLocationVerificationMutation.isPending}
-                          className="sr-only peer"
-                        />
-                        <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-                      </label>
-                    </div>
 
                     <div className="flex items-center justify-between">
                       <div>

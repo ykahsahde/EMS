@@ -2,8 +2,8 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useAuth } from '../contexts/AuthContext'
 import { holidayAPI } from '../services/api'
-import { 
-  Calendar, Plus, Edit2, Trash2, PartyPopper, MapPin 
+import {
+  Calendar, Plus, Edit2, Trash2, PartyPopper
 } from 'lucide-react'
 import { format, parseISO, isSameMonth, isSameYear } from 'date-fns'
 import toast from 'react-hot-toast'
@@ -21,8 +21,7 @@ const Holidays = () => {
     name: '',
     date: '',
     type: 'NATIONAL',
-    is_optional: false,
-    applicable_locations: ''
+    is_optional: false
   })
 
   // Fetch holidays
@@ -80,8 +79,7 @@ const Holidays = () => {
       name: '',
       date: '',
       type: 'NATIONAL',
-      is_optional: false,
-      applicable_locations: ''
+      is_optional: false
     })
   }
 
@@ -91,20 +89,14 @@ const Holidays = () => {
       name: holiday.name || '',
       date: holiday.date ? format(parseISO(holiday.date), 'yyyy-MM-dd') : '',
       type: holiday.type || 'NATIONAL',
-      is_optional: holiday.is_optional || false,
-      applicable_locations: holiday.applicable_locations?.join(', ') || ''
+      is_optional: holiday.is_optional || false
     })
     setShowModal(true)
   }
 
   const handleSubmit = (e) => {
     e.preventDefault()
-    const data = {
-      ...formData,
-      applicable_locations: formData.applicable_locations 
-        ? formData.applicable_locations.split(',').map(l => l.trim()).filter(Boolean)
-        : []
-    }
+    const data = { ...formData }
 
     if (editingHoliday) {
       updateMutation.mutate({ id: editingHoliday.id, data })
@@ -161,7 +153,7 @@ const Holidays = () => {
             ))}
           </select>
           {(isAdmin || isHR) && (
-            <button 
+            <button
               onClick={() => {
                 setEditingHoliday(null)
                 resetForm()
@@ -233,8 +225,8 @@ const Holidays = () => {
                 </h3>
                 <div className="space-y-3">
                   {monthHolidays.map((holiday) => (
-                    <div 
-                      key={holiday.id} 
+                    <div
+                      key={holiday.id}
                       className="flex items-center justify-between p-3 bg-gray-50 rounded-lg hover:bg-gray-100 transition-colors"
                     >
                       <div className="flex items-center gap-4">
@@ -255,12 +247,6 @@ const Holidays = () => {
                             {holiday.is_optional && (
                               <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 text-gray-600">
                                 Optional
-                              </span>
-                            )}
-                            {holiday.applicable_locations?.length > 0 && (
-                              <span className="text-xs text-gray-500 flex items-center gap-1">
-                                <MapPin className="w-3 h-3" />
-                                {holiday.applicable_locations.join(', ')}
                               </span>
                             )}
                           </div>
@@ -294,7 +280,7 @@ const Holidays = () => {
               <Calendar className="w-12 h-12 mx-auto text-gray-300 mb-3" />
               <p>No holidays for {selectedYear}</p>
               {(isAdmin || isHR) && (
-                <button 
+                <button
                   onClick={() => setShowModal(true)}
                   className="mt-2 text-primary-600 hover:text-primary-700 font-medium"
                 >
@@ -354,19 +340,6 @@ const Holidays = () => {
                   <option value="COMPANY">Company Holiday</option>
                 </select>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Applicable Locations
-                </label>
-                <input
-                  type="text"
-                  value={formData.applicable_locations}
-                  onChange={(e) => setFormData({ ...formData, applicable_locations: e.target.value })}
-                  className="input-field"
-                  placeholder="Mumbai, Delhi, Bangalore (comma-separated)"
-                />
-                <p className="text-xs text-gray-500 mt-1">Leave empty for all locations</p>
-              </div>
               <div className="flex items-center gap-3">
                 <input
                   type="checkbox"
@@ -396,8 +369,8 @@ const Holidays = () => {
                   disabled={createMutation.isPending || updateMutation.isPending}
                   className="btn-primary flex-1"
                 >
-                  {(createMutation.isPending || updateMutation.isPending) 
-                    ? 'Saving...' 
+                  {(createMutation.isPending || updateMutation.isPending)
+                    ? 'Saving...'
                     : editingHoliday ? 'Update' : 'Add Holiday'
                   }
                 </button>

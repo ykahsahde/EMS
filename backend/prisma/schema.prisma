@@ -55,10 +55,6 @@ model User {
   shiftId           String?            @map("shift_id") @db.Uuid
   managerId         String?            @map("manager_id") @db.Uuid
   dateOfJoining     DateTime           @map("date_of_joining") @db.Date
-  dateOfBirth       DateTime?          @map("date_of_birth") @db.Date
-  address           String?
-  emergencyContact  String?            @map("emergency_contact") @db.VarChar(20)
-  profilePictureUrl String?            @map("profile_picture_url")
   faceDescriptor    Json?              @map("face_descriptor")
   faceRegisteredAt  DateTime?          @map("face_registered_at") @db.Timestamptz(6)
   lastLogin         DateTime?          @map("last_login") @db.Timestamptz(6)

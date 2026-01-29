@@ -4,13 +4,11 @@ const bcrypt = require('bcryptjs');
 const prisma = new PrismaClient();
 
 async function main() {
-  console.log('🌱 Starting database seeding...\n');
+  console.log(' Starting database seeding...\n');
 
-  // =====================================================
-  // 1. SEED DEPARTMENTS
-  // =====================================================
-  console.log('📁 Seeding Departments...');
-  
+
+  console.log(' Seeding Departments...');
+
   const departments = [
     { name: 'Administration', code: 'ADMIN', description: 'Administrative and executive management' },
     { name: 'Human Resources', code: 'HR', description: 'HR, recruitment, and employee welfare' },
@@ -29,13 +27,13 @@ async function main() {
       create: dept,
     });
   }
-  console.log(`   ✅ ${departments.length} departments seeded\n`);
+  console.log(` ${departments.length} departments seeded\n`);
 
   // =====================================================
   // 2. SEED SHIFTS
   // =====================================================
-  console.log('⏰ Seeding Shifts...');
-  
+  console.log('Seeding Shifts...');
+
   const shifts = [
     {
       name: 'Day Shift',
@@ -86,7 +84,7 @@ async function main() {
       create: shift,
     });
   }
-  console.log(`   ✅ ${shifts.length} shifts seeded\n`);
+  console.log(`    ${shifts.length} shifts seeded\n`);
 
   // Get department and shift IDs for user creation
   const adminDept = await prisma.department.findUnique({ where: { code: 'ADMIN' } });
@@ -98,8 +96,8 @@ async function main() {
   // =====================================================
   // 3. SEED DEFAULT USERS
   // =====================================================
-  console.log('👤 Seeding Users...');
-  
+  console.log(' Seeding Users...');
+
   const defaultPassword = await bcrypt.hash('Admin@123', 12);
   const gmPassword = await bcrypt.hash('Gm@12345', 12);
 
@@ -178,17 +176,15 @@ async function main() {
       create: user,
     });
   }
-  console.log(`   ✅ ${users.length} users seeded\n`);
+  console.log(`    ${users.length} users seeded\n`);
 
-  // =====================================================
-  // 4. SEED 2025 & 2026 HOLIDAYS
-  // =====================================================
-  console.log('🎉 Seeding Holidays...');
-  
+
+  console.log('Seeding Holidays...');
+
   const holidays = [
     // 2025 Holidays
     { name: "New Year's Eve", date: new Date('2025-12-31'), year: 2025, isOptional: true },
-    
+
     // 2026 Holidays
     { name: 'New Year', date: new Date('2026-01-01'), year: 2026, isOptional: false },
     { name: 'Republic Day', date: new Date('2026-01-26'), year: 2026, isOptional: false },
@@ -224,17 +220,15 @@ async function main() {
     } catch (error) {
       // Skip duplicates silently
       if (!error.message.includes('Unique constraint')) {
-        console.log(`   ⚠️ Skipped duplicate: ${holiday.name}`);
+        console.log(`    Skipped duplicate: ${holiday.name}`);
       }
     }
   }
-  console.log(`   ✅ ${holidayCount} holidays seeded\n`);
+  console.log(`    ${holidayCount} holidays seeded\n`);
 
-  // =====================================================
-  // 5. SEED LEAVE BALANCES FOR 2026
-  // =====================================================
-  console.log('📋 Seeding Leave Balances for 2026...');
-  
+
+  console.log(' Seeding Leave Balances for 2026...');
+
   const allUsers = await prisma.user.findMany({
     where: { status: 'ACTIVE' },
     select: { id: true },
@@ -264,16 +258,14 @@ async function main() {
       });
       leaveBalanceCount++;
     } catch (error) {
-      // Skip if already exists
+
     }
   }
-  console.log(`   ✅ ${leaveBalanceCount} leave balances seeded\n`);
+  console.log(`    ${leaveBalanceCount} leave balances seeded\n`);
 
-  // =====================================================
-  // 6. SEED ATTENDANCE CONFIG
-  // =====================================================
-  console.log('⚙️ Seeding Attendance Config...');
-  
+
+  console.log('Seeding Attendance Config...');
+
   const configs = [
     { configKey: 'face_recognition_threshold', configValue: '0.6', description: 'Minimum face match score (0.0 to 1.0)', dataType: 'float' },
     { configKey: 'auto_checkout_enabled', configValue: 'true', description: 'Enable automatic checkout at end of shift', dataType: 'boolean' },
@@ -292,10 +284,10 @@ async function main() {
       create: config,
     });
   }
-  console.log(`   ✅ ${configs.length} config entries seeded\n`);
+  console.log(`    ${configs.length} config entries seeded\n`);
 
-  console.log('🎉 Database seeding completed successfully!\n');
-  console.log('📌 Default Credentials:');
+  console.log(' Database seeding completed successfully!\n');
+  console.log(' Default Credentials:');
   console.log('   Admin:    admin@raymond.in / Admin@123');
   console.log('   HR:       hr@raymond.in / Admin@123');
   console.log('   Manager:  manager@raymond.in / Admin@123');
@@ -305,7 +297,7 @@ async function main() {
 
 main()
   .catch((e) => {
-    console.error('❌ Seeding failed:', e);
+    console.error(' Seeding failed:', e);
     process.exit(1);
   })
   .finally(async () => {
