@@ -1,4 +1,4 @@
-# Raymond Lifestyle Ltd. - Attendance Management System
+# EMS - Attendance Management System
 
 A complete attendance management system with face recognition, leave management, and reporting capabilities.
 
@@ -47,11 +47,11 @@ npm run dev
 
 | Email | Password | Role |
 |-------|----------|------|
-| admin@raymond.com | Admin@123 | Admin |
-| gm@raymond.com | Gm@12345 | GM (Director) |
-| hr@raymond.com | Hr@12345 | HR |
-| manager@raymond.com | Manager@123 | Manager |
-| employee@raymond.com | Employee@123 | Employee |
+| admin@ems.com | Admin@123 | Admin |
+| gm@ems.com | Gm@12345 | GM (Director) |
+| hr@ems.com | Hr@12345 | HR |
+| manager@ems.com | Manager@123 | Manager |
+| employee@ems.com | Employee@123 | Employee |
 
 ## Features
 
@@ -78,7 +78,7 @@ npm run dev
 
 Create `backend/.env`:
 ```env
-DATABASE_URL="postgresql://raymond_admin:Raymond@2024Secure@localhost:5432/raymond_attendance"
+DATABASE_URL="postgresql://ems_admin:EMS@2024Secure@localhost:5432/ems_attendance"
 JWT_SECRET=your-secret-key
 JWT_EXPIRES_IN=8h
 PORT=3000
@@ -95,7 +95,7 @@ docker-compose up -d
 docker-compose down
 
 # Access database CLI
-docker exec -it raymond_postgres psql -U raymond_admin -d raymond_attendance
+docker exec -it ems_postgres psql -U ems_admin -d ems_attendance
 
 # View logs
 docker-compose logs -f backend
